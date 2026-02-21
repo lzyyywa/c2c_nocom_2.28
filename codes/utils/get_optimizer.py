@@ -1,4 +1,5 @@
 import torch
+
 def get_optimizer_vm(cfg,model):
     comp_param=[]
     video_en_param=[]
@@ -27,6 +28,7 @@ def get_optimizer_vlm(cfg,model):
                 vision_no_wd.append(param)
             elif 'Adapter' in name or 'clip_proj' in name:
                 vision_with_wd.append(param)
+                
     if cfg.text_encoding_manner=='composition':
         for name, param in model.named_parameters():
             if 'dfsp' in name:
@@ -37,15 +39,22 @@ def get_optimizer_vlm(cfg,model):
             {'params': vision_no_wd, 'lr': cfg.visual_lr, 'weight_decay': 0.0}, ],
             betas=(0.9, 0.999), lr=cfg.visual_lr, eps=1e-8,
             weight_decay=cfg.visual_wd)  # Params used from paper, the lr is
+            
     elif cfg.text_encoding_manner=='component':
         for name, param in model.verb_prompt_learner.named_parameters():
             prompt_param.append(param)
         for name, param in model.obj_prompt_learner.named_parameters():
             if 'token_embedding' not in name:
                 prompt_param.append(param)
+                
         for name, param in model.named_parameters():
             if 'c2c' in name:
                 c2c_with_wd.append(param)
+            # --- Added: Catch hyperbolic parameters (curv and alphas) and apply no weight decay to prevent manifold collapse ---
+            elif 'curv' in name or 'alpha' in name:
+                c2c_no_wd.append(param)
+            # -------------------------------------------------------------------------------------------------------------------
+                
         optimizer = torch.optim.AdamW([
             {'params':  prompt_param, 'lr': cfg.text_lr, 'weight_decay': cfg.text_wd},
             {'params': vision_with_wd, 'lr': cfg.visual_lr, 'weight_decay': cfg.visual_wd},

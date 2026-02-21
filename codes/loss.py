@@ -9,6 +9,9 @@ import torch.nn as nn
 import torch
 import numpy as np
 
+# --- Added: Import lorentz operations for hyperbolic loss calculations ---
+import models.vlm_models.lorentz as L
+# -----------------------------------------------------------------------
 
 def loss_calu(predict, target, config):
     loss_fn = CrossEntropyLoss()
@@ -133,3 +136,42 @@ class Gml_loss(nn.Module):
         loss = (-1.0 / n_o) * p_ba_log.sum()
 
         return loss
+
+# ====== Added Hyperbolic Hierarchical and Alignment Losses ======
+
+def HierarchicalEntailmentLoss(child, parent, curv):
+    """
+    Computes the compositional entailment loss in hyperbolic space based on Cone Entailment.
+    Enforces that the child node lies within the entailment cone of the parent node,
+    and that the child has a larger hyperbolic norm (is further from the origin) than the parent.
+    """
+    # Calculate half-aperture angle of the parent's entailment cone
+    theta_parent = L.half_aperture(parent, curv)
+    
+    # Calculate the exterior angle at origin between child and parent
+    angle_cp = L.oxy_angle(child, parent, curv)
+    
+    # Cone constraint: the angle between child and parent should be smaller than half-aperture
+    cone_penalty = torch.clamp(angle_cp - theta_parent, min=0.0)
+    
+    # Norm constraint: child should be more specific (further from origin) than parent
+    norm_child = torch.norm(child, dim=-1)
+    norm_parent = torch.norm(parent, dim=-1)
+    norm_penalty = torch.clamp(norm_parent - norm_child, min=0.0)
+    
+    # Combine penalties
+    return (cone_penalty + 0.1 * norm_penalty).mean()
+
+
+def HyperbolicAlignmentLoss(visual_feat, text_feat, curv):
+    """
+    Aligns visual features and corresponding text features in hyperbolic space 
+    by minimizing their pairwise distance.
+    """
+    # Calculate pairwise distance
+    dist = L.pairwise_dist(visual_feat, text_feat, curv)
+    
+    # Since visual_feat and text_feat are batch-aligned, we minimize the diagonal (positive pairs)
+    return dist.diag().mean()
+
+# ================================================================

@@ -14,10 +14,7 @@ from utils.ade_utils import emd_inference_opencv_test
 from collections import Counter
 
 from utils.hsic import hsic_normalized_cca
-
-# --- Added: import clip to process coarse text features ---
 from clip import clip
-# ----------------------------------------------------------
 
 def cal_conditional(attr2idx, obj2idx, set_name, daset):
     def load_split(path):
@@ -64,12 +61,9 @@ def evaluate(model, dataset, config):
         config
     )
     result = ""
-    # key_set = ["best_seen", "best_unseen", "AUC", "best_hm", "attr_acc", "obj_acc"]
-    # key_set = [ "attr_acc", "obj_acc",'attr_acc_open','obj_acc_open',"ub_seen","ub_unseen","ub_all","ub_open_seen","ub_open_unseen","ub_open_all","best_seen", "best_unseen", "best_hm","AUC"]
     key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
 
     for key in key_set:
-        # if key in key_set:
         result = result + key + "  " + str(round(test_stats[key], 4)) + "| "
     print(result)
     model.train()
@@ -81,7 +75,6 @@ def save_checkpoint(state, save_path, epoch, best=False):
     torch.save(state, filename)
 
 
-# ========conditional train=
 def rand_bbox(size, lam):
     W = size[-2]
     H = size[-1]
@@ -89,7 +82,6 @@ def rand_bbox(size, lam):
     cut_w = np.int_(W * cut_rat)
     cut_h = np.int_(H * cut_rat)
 
-    # uniform
     cx = np.random.randint(W)
     cy = np.random.randint(H)
 
@@ -111,7 +103,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         pin_memory=True
     )
 
-    # --- Added: Pre-extract coarse text Euclidean features using frozen CLIP to save VRAM and time ---
     print("Pre-extracting coarse text Euclidean features using frozen CLIP...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     frozen_clip, _ = clip.load(config.backbone, device=device)
@@ -121,22 +112,18 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     coarse_o_feats_dict = {}
     
     with torch.no_grad():
-        # Process unique coarse verbs
         for cv in set(train_dataset.verb_hierarchy.values()):
             tokens = clip.tokenize(f"an action of {cv}").cuda()
             feat = frozen_clip.encode_text(tokens).float()
             coarse_v_feats_dict[cv] = feat
             
-        # Process unique coarse objects
         for co in set(train_dataset.obj_hierarchy.values()):
             tokens = clip.tokenize(f"a photo of a {co}").cuda()
             feat = frozen_clip.encode_text(tokens).float()
             coarse_o_feats_dict[co] = feat
             
-    # Free memory
     del frozen_clip
     print("Pre-extraction complete.")
-    # -----------------------------------------------------------------------------------------------
 
     model.train()
     best_loss = 1e5
@@ -162,10 +149,8 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_oo_losses = []
         epoch_vv_losses = []
         
-        # --- Added: track entailment and alignment losses ---
         epoch_ent_losses = []
         epoch_ali_losses = []
-        # --------------------------------------------------
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
@@ -178,61 +163,64 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
             
-            # Extract coarse texts for current batch
             batch_coarse_verb = batch[4]
             batch_coarse_obj = batch[5]
 
+            # -------------------------------------------------------------------------
+            # 1. 允许欧式空间的计算在 FP16 (AMP) 下进行
+            # -------------------------------------------------------------------------
             with torch.cuda.amp.autocast(enabled=True):
                 p_v_hyp, p_o_hyp, p_pair_v, p_pair_o, vid_feat, o_feat, v_feat, p_v_con_o, p_o_con_v, \
                 v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
-                # component loss (using hyperbolic distance logits)
-                loss_verb = Loss_fn(p_v_hyp * config.cosine_scale, batch_verb)
-                loss_obj = Loss_fn(p_o_hyp * config.cosine_scale, batch_obj)
-                
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 pred_com_train = (p_pair_v + p_pair_o)[:, train_v_inds, train_o_inds]
+                # loss_com 是欧式概率，使用 cosine_scale (100) 是安全的
                 loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
                 
-                # --- Added: Coarse concept hyperbolic mapping and Hierarchical Losses ---
-                
-                # 1. Lookup and process coarse features through C2C linear projection to match dimensions
                 coarse_v_raw = torch.cat([coarse_v_feats_dict[cv] for cv in batch_coarse_verb], dim=0).cuda()
                 coarse_o_raw = torch.cat([coarse_o_feats_dict[co] for co in batch_coarse_obj], dim=0).cuda()
                 
                 coarse_v_eucl = actual_model.c2c_text_v(coarse_v_raw)
                 coarse_o_eucl = actual_model.c2c_text_o(coarse_o_raw)
                 
-                # 2. Map coarse Euclidean features to Hyperbolic space
-                v_alpha = actual_model.textual_alpha.exp()
+            # -------------------------------------------------------------------------
+            # 2. FIX: 强制退出半精度，所有双曲运算和映射必须在 FP32 下进行，防止 NaN
+            # -------------------------------------------------------------------------
+            with torch.cuda.amp.autocast(enabled=False):
+                # FIX 1: 双曲负距离 Logit 不能乘以 100，改用安全温度缩放 20.0
+                loss_verb = Loss_fn(p_v_hyp.float() * 20.0, batch_verb)
+                loss_obj = Loss_fn(p_o_hyp.float() * 20.0, batch_obj)
+                
+                # 显式转换为 float32
+                _curv_fp32 = _curv.float()
+                v_alpha_fp32 = actual_model.textual_alpha.exp().float()
+                coarse_v_eucl_fp32 = coarse_v_eucl.float()
+                coarse_o_eucl_fp32 = coarse_o_eucl.float()
+                
                 import models.vlm_models.lorentz as L
-                coarse_v_hyp = L.exp_map0(coarse_v_eucl * v_alpha, _curv)
-                coarse_o_hyp = L.exp_map0(coarse_o_eucl * v_alpha, _curv)
+                coarse_v_hyp = L.exp_map0(coarse_v_eucl_fp32 * v_alpha_fp32, _curv_fp32)
+                coarse_o_hyp = L.exp_map0(coarse_o_eucl_fp32 * v_alpha_fp32, _curv_fp32)
                 
-                # 3. Calculate 4 sets of Hierarchical Entailment Losses
-                # Select the fine hyperbolic features corresponding to current batch ground truths
-                batch_fine_v_hyp = verb_text_hyp[batch_verb]
-                batch_fine_o_hyp = obj_text_hyp[batch_obj]
+                batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
+                batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
+                v_feat_hyp_fp32 = v_feat_hyp.float()
+                o_feat_hyp_fp32 = o_feat_hyp.float()
                 
-                # 3a. Semantic Entailment (Fine Concept -> Coarse Concept)
-                loss_ent_v = HierarchicalEntailmentLoss(batch_fine_v_hyp, coarse_v_hyp, _curv)
-                loss_ent_o = HierarchicalEntailmentLoss(batch_fine_o_hyp, coarse_o_hyp, _curv)
-                
-                # 3b. Compositional Entailment (Video Features -> Fine Concept)
-                loss_ent_vid_v = HierarchicalEntailmentLoss(v_feat_hyp, batch_fine_v_hyp, _curv)
-                loss_ent_vid_o = HierarchicalEntailmentLoss(o_feat_hyp, batch_fine_o_hyp, _curv)
+                loss_ent_v = HierarchicalEntailmentLoss(batch_fine_v_hyp, coarse_v_hyp, _curv_fp32)
+                loss_ent_o = HierarchicalEntailmentLoss(batch_fine_o_hyp, coarse_o_hyp, _curv_fp32)
+                loss_ent_vid_v = HierarchicalEntailmentLoss(v_feat_hyp_fp32, batch_fine_v_hyp, _curv_fp32)
+                loss_ent_vid_o = HierarchicalEntailmentLoss(o_feat_hyp_fp32, batch_fine_o_hyp, _curv_fp32)
                 
                 loss_entailment = loss_ent_v + loss_ent_o + loss_ent_vid_v + loss_ent_vid_o
                 
-                # 4. Calculate Discriminative Alignment Loss (Visual -> Coarse Text)
-                loss_align_v = HyperbolicAlignmentLoss(v_feat_hyp, coarse_v_hyp, _curv)
-                loss_align_o = HyperbolicAlignmentLoss(o_feat_hyp, coarse_o_hyp, _curv)
+                loss_align_v = HyperbolicAlignmentLoss(v_feat_hyp_fp32, coarse_v_hyp, _curv_fp32)
+                loss_align_o = HyperbolicAlignmentLoss(o_feat_hyp_fp32, coarse_o_hyp, _curv_fp32)
                 
                 loss_alignment = loss_align_v + loss_align_o
                 
-                # 5. Total Loss Fusion (Using safe preset hyper-parameter weight 0.1 for new terms)
-                loss = loss_com + 0.2 * (loss_verb + loss_obj) + 0.1 * loss_entailment + 0.1 * loss_alignment
-                # ------------------------------------------------------------------------
+                # 统一为 FP32 计算最终 loss
+                loss = loss_com.float() + 0.2 * (loss_verb + loss_obj) + 0.1 * loss_entailment + 0.1 * loss_alignment
                 
                 loss = loss / config.gradient_accumulation_steps
 
@@ -241,12 +229,16 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             # weights update
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
-                scaler.unscale_(optimizer)  # TODO:May be the reason for low acc on verb
-                # scaler.step(prompt_optimizer)
+                scaler.unscale_(optimizer)
+                
+                # -------------------------------------------------------------------------
+                # 3. FIX: 强制梯度截断，防止双曲空间特有的梯度突刺撕裂参数
+                # -------------------------------------------------------------------------
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
 
-                # prompt_optimizer.zero_grad()
                 optimizer.zero_grad()
 
             epoch_train_losses.append(loss.item())
@@ -254,15 +246,12 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_vv_losses.append(loss_verb.item())
             epoch_oo_losses.append(loss_obj.item())
             
-            # --- Added: Track new losses ---
             epoch_ent_losses.append(loss_entailment.item())
             epoch_ali_losses.append(loss_alignment.item())
-            # -------------------------------
 
             progress_bar.set_postfix({"train loss": np.mean(epoch_train_losses[-50:])})
             progress_bar.update()
 
-            # break
         lr_scheduler.step()
         progress_bar.close()
         progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}")
@@ -273,10 +262,8 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} vv loss {np.mean(epoch_vv_losses)}\n")
         log_training.write(f"epoch {i + 1} oo loss {np.mean(epoch_oo_losses)}\n")
         
-        # --- Added: Write new losses to log ---
         log_training.write(f"epoch {i + 1} entailment loss {np.mean(epoch_ent_losses)}\n")
         log_training.write(f"epoch {i + 1} alignment loss {np.mean(epoch_ali_losses)}\n")
-        # --------------------------------------
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({
@@ -285,8 +272,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 'scheduler': lr_scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
             }, config.save_path, i)
-        # if (i + 1) > config.val_epochs_ts:
-        #     torch.save(model.state_dict(), os.path.join(config.save_path, f"epoch_{i}.pt"))
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm",
                    "AUC"]
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
@@ -341,8 +326,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
         log_training.write('\n')
         log_training.flush()
-        key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm",
-                   "AUC"]
         if i + 1 == config.epochs:
             print("Evaluating test dataset on Closed World")
             model.load_state_dict(torch.load(os.path.join(
@@ -358,3 +341,5 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             print("Final Loss average on test dataset: {}".format(loss_avg))
             log_training.write('\n')
             log_training.write("Final Loss average on test dataset: {}\n".format(loss_avg))
+
+

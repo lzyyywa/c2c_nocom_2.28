@@ -4,8 +4,10 @@ import random
 from torch.utils.data.dataloader import DataLoader
 import tqdm
 import test as test
-from loss import *
+# [HYPERBOLIC] 引入纯净损失类
+from loss import EntailmentConeLoss, HyperbolicHardNegativeAlignmentLoss
 from loss import KLLoss
+from torch.nn.modules.loss import CrossEntropyLoss
 import torch.multiprocessing
 import numpy as np
 import json
@@ -173,9 +175,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 p_v_hyp, p_o_hyp, p_pair_v, p_pair_o, vid_feat, o_feat, v_feat, p_v_con_o, p_o_con_v, \
                 v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
+                # 组合模块输出的是欧式特征，严格保留欧式交叉熵与 100倍缩放！
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 pred_com_train = (p_pair_v + p_pair_o)[:, train_v_inds, train_o_inds]
-                # loss_com 是欧式概率，使用 cosine_scale (100) 是安全的
                 loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
                 
                 coarse_v_raw = torch.cat([coarse_v_feats_dict[cv] for cv in batch_coarse_verb], dim=0).cuda()
@@ -185,10 +187,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 coarse_o_eucl = actual_model.c2c_text_o(coarse_o_raw)
                 
             # -------------------------------------------------------------------------
-            # 2. FIX: 强制退出半精度，所有双曲运算和映射必须在 FP32 下进行，防止 NaN
+            # 2. 强制退出半精度，所有双曲运算和映射必须在 FP32 下进行，防止 NaN
             # -------------------------------------------------------------------------
             with torch.cuda.amp.autocast(enabled=False):
-                # FIX 1: 双曲负距离 Logit 不能乘以 100，改用安全温度缩放 20.0
+                # 双曲负距离 Logit 使用安全温度缩放 20.0
                 loss_verb = Loss_fn(p_v_hyp.float() * 20.0, batch_verb)
                 loss_obj = Loss_fn(p_o_hyp.float() * 20.0, batch_obj)
                 
@@ -207,20 +209,36 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 v_feat_hyp_fp32 = v_feat_hyp.float()
                 o_feat_hyp_fp32 = o_feat_hyp.float()
                 
-                loss_ent_v = HierarchicalEntailmentLoss(batch_fine_v_hyp, coarse_v_hyp, _curv_fp32)
-                loss_ent_o = HierarchicalEntailmentLoss(batch_fine_o_hyp, coarse_o_hyp, _curv_fp32)
-                loss_ent_vid_v = HierarchicalEntailmentLoss(v_feat_hyp_fp32, batch_fine_v_hyp, _curv_fp32)
-                loss_ent_vid_o = HierarchicalEntailmentLoss(o_feat_hyp_fp32, batch_fine_o_hyp, _curv_fp32)
+                # =====================================================================
+                # [HYPERBOLIC LOSS] 实例化并调用纯净的公式类
+                # =====================================================================
+                entail_loss_fn = EntailmentConeLoss(margin=0.01)
+                align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=0.2)
+                
+                # 层次蕴含损失 (Entailment)
+                loss_ent_v = entail_loss_fn(batch_fine_v_hyp, coarse_v_hyp, _curv_fp32)
+                loss_ent_o = entail_loss_fn(batch_fine_o_hyp, coarse_o_hyp, _curv_fp32)
+                loss_ent_vid_v = entail_loss_fn(v_feat_hyp_fp32, batch_fine_v_hyp, _curv_fp32)
+                loss_ent_vid_o = entail_loss_fn(o_feat_hyp_fp32, batch_fine_o_hyp, _curv_fp32)
                 
                 loss_entailment = loss_ent_v + loss_ent_o + loss_ent_vid_v + loss_ent_vid_o
                 
-                loss_align_v = HyperbolicAlignmentLoss(v_feat_hyp_fp32, coarse_v_hyp, _curv_fp32)
-                loss_align_o = HyperbolicAlignmentLoss(o_feat_hyp_fp32, coarse_o_hyp, _curv_fp32)
+                # 判别对齐损失 (Alignment)
+                loss_align_v = align_loss_fn(p_v_hyp.float(), batch_verb)
+                loss_align_o = align_loss_fn(p_o_hyp.float(), batch_obj)
                 
                 loss_alignment = loss_align_v + loss_align_o
                 
+                # =====================================================================
+                # 显式提取配置权重 (强制 Fail-Fast 机制，无默认值！)
+                # =====================================================================
+                w_att_obj = config.loss_weights['att_obj_w']
+                w_align = config.loss_weights['lambda_align']
+                w_entail = config.loss_weights['lambda_entail']
+
                 # 统一为 FP32 计算最终 loss
-                loss = loss_com.float() + 0.2 * (loss_verb + loss_obj) + 0.1 * loss_entailment + 0.1 * loss_alignment
+                loss_base = loss_com.float() + w_att_obj * (loss_verb + loss_obj)
+                loss = loss_base + w_entail * loss_entailment + w_align * loss_alignment
                 
                 loss = loss / config.gradient_accumulation_steps
 
@@ -231,9 +249,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
                 scaler.unscale_(optimizer)
                 
-                # -------------------------------------------------------------------------
-                # 3. FIX: 强制梯度截断，防止双曲空间特有的梯度突刺撕裂参数
-                # -------------------------------------------------------------------------
+                # 强制梯度截断，防止双曲空间特有的梯度突刺撕裂参数
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
                 
                 scaler.step(optimizer)
@@ -341,5 +357,3 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             print("Final Loss average on test dataset: {}".format(loss_avg))
             log_training.write('\n')
             log_training.write("Final Loss average on test dataset: {}\n".format(loss_avg))
-
-

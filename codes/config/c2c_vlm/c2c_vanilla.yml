@@ -80,3 +80,7 @@ test:
   bias: 0.001
   pretrain: False
   load_model:  YOUR_PATH
+loss_weights:
+  att_obj_w: 0.2
+  lambda_align: 1.0
+  lambda_entail: 0.1

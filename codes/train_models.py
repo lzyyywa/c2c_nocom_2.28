@@ -232,9 +232,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 # =====================================================================
                 # 显式提取配置权重 (强制 Fail-Fast 机制，无默认值！)
                 # =====================================================================
-                w_att_obj = config.loss_weights['att_obj_w']
-                w_align = config.loss_weights['lambda_align']
-                w_entail = config.loss_weights['lambda_entail']
+                w_att_obj = config.att_obj_w
+                w_align = config.lambda_align
+                w_entail = config.lambda_entail
 
                 # 统一为 FP32 计算最终 loss
                 loss_base = loss_com.float() + w_att_obj * (loss_verb + loss_obj)

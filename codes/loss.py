@@ -39,10 +39,16 @@ class EntailmentConeLoss(nn.Module):
     【双曲层级蕴含损失】(Hierarchical Entailment Cone Loss)
     强迫细粒度子概念进入粗粒度父概念的蕴含锥 (Cone) 内。
     包含：1. 角度惩罚 (Cone Penalty)  2. 范数惩罚 (Norm Penalty)
+    [已修复]: 引入 safe_norm，防止特征趋近原点时梯度为 NaN
     """
     def __init__(self, margin=0.01):
         super().__init__()
         self.margin = margin
+
+    # 本地化防崩塌算子
+    def safe_norm(self, x, dim=-1):
+        # 强制加入 eps=1e-7，斩断 sqrt(0) 求导时分母为 0 的可能性
+        return torch.sqrt(torch.clamp(torch.sum(x**2, dim=dim), min=1e-7))
 
     def forward(self, child_emb, parent_emb, curv):
         # 1. 计算父节点的半顶角与实际夹角
@@ -53,8 +59,9 @@ class EntailmentConeLoss(nn.Module):
         violation = torch.clamp(angle - aperture + self.margin, min=0.0)
         
         # 2. 范数惩罚: 强迫子节点(更具体)距离原点更远
-        norm_child = torch.norm(child_emb, dim=-1)
-        norm_parent = torch.norm(parent_emb, dim=-1)
+        # [严防死守] 替换原有的 torch.norm 为 safe_norm
+        norm_child = self.safe_norm(child_emb, dim=-1)
+        norm_parent = self.safe_norm(parent_emb, dim=-1)
         norm_penalty = torch.clamp(norm_parent - norm_child, min=0.0)
         
         return (violation + 0.1 * norm_penalty).mean()

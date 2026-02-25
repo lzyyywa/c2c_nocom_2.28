@@ -24,16 +24,13 @@ class MLP(nn.Module):
             else:
                 outgoing = layers[layer_ind]
             mod.append(nn.Linear(incoming, outgoing, bias=bias))
-
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
-
         mod.append(nn.Linear(incoming, out_dim, bias=bias))
-
         if relu:
             mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
@@ -53,16 +50,13 @@ class MLP_ST(nn.Module):
             else:
                 outgoing = layers[layer_ind]
             mod.append(nn.Conv1d(incoming, outgoing, kernel_size=3, bias=bias, padding=1))
-
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
-
         mod.append(nn.Conv1d(incoming, out_dim, kernel_size=3, bias=bias, padding=1))
-
         if relu:
             mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
@@ -136,17 +130,14 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
+        # 仅保留基础的独立基元特征提取器 (彻底抛弃复杂的推断模块)
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
-        self.c2c_OE2 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
-        self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
-
-        self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
-        self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
 
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
+        # 双曲切空间投影头
         self.hyp_proj_v_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
@@ -162,6 +153,7 @@ class CustomCLIP(nn.Module):
         nn.init.zeros_(self.hyp_proj_o_text.bias)
 
     def forward(self, video, pairs=None):
+        # 1. 提取基础特征
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
         verb_text_features = self.c2c_text_v(verb_text_features)
@@ -176,6 +168,7 @@ class CustomCLIP(nn.Module):
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
+        # 2. 安全归一化防溢出
         o_feat_normed = torch.nan_to_num(F.normalize(o_feat, dim=1, eps=1e-5))
         v_feat_normed = torch.nan_to_num(F.normalize(v_feat, dim=1, eps=1e-5))
 
@@ -185,69 +178,35 @@ class CustomCLIP(nn.Module):
         obj_text_features_norm = obj_text_features / (obj_text_features.norm(dim=-1, keepdim=True) + 1e-5)
         obj_text_features_norm = torch.nan_to_num(obj_text_features_norm)
 
-        verb_logits_eucl = torch.nan_to_num(v_feat_normed @ verb_text_features_norm.t())
-        obj_logits_eucl = torch.nan_to_num(o_feat_normed @ obj_text_features_norm.t())
-
-        verb_logits_prob = verb_logits_eucl * 0.5 + 0.5
-        obj_logits_prob = obj_logits_eucl * 0.5 + 0.5
-
-        b = video_features.shape[0]
-        c = verb_text_features.shape[-1]
-        n_v = verb_logits_prob.shape[-1]
-        n_o = obj_logits_prob.shape[-1]
-
-        # [最后一块防弹衣]: 给推断区的原始特征加上保护
-        o_feat_c = torch.nan_to_num(self.c2c_OE2(video_features.mean(dim=-1)))
-        v_feat_c = torch.nan_to_num(self.c2c_VE2(video_features).mean(dim=-1))
-
-        p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b, c, n_v)
-        p_pair_o = p_v_con_o * obj_logits_prob.unsqueeze(1)  
-        p_pair_v = p_o_con_v * verb_logits_prob.unsqueeze(-1)  
-
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
         self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
         self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
 
+        # 3. 直通双曲空间！纯净计算距离
         with torch.autocast(video_features.device.type, dtype=torch.float32):
             v_feat_tangent = self.hyp_proj_v_vis(v_feat_normed.float())
             o_feat_tangent = self.hyp_proj_o_vis(o_feat_normed.float())
             verb_text_tangent = self.hyp_proj_v_text(verb_text_features_norm.float())
             obj_text_tangent = self.hyp_proj_o_text(obj_text_features_norm.float())
 
-            v_feat_hyp = L.exp_map0(v_feat_tangent * self.visual_alpha.exp().float(), _curv)
-            o_feat_hyp = L.exp_map0(o_feat_tangent * self.visual_alpha.exp().float(), _curv)
-            verb_text_hyp = L.exp_map0(verb_text_tangent * self.textual_alpha.exp().float(), _curv)
-            obj_text_hyp = L.exp_map0(obj_text_tangent * self.textual_alpha.exp().float(), _curv)
+            v_feat_hyp = L.exp_map0(v_feat_tangent * self.visual_alpha.exp().float(), _curv.float())
+            o_feat_hyp = L.exp_map0(o_feat_tangent * self.visual_alpha.exp().float(), _curv.float())
+            verb_text_hyp = L.exp_map0(verb_text_tangent * self.textual_alpha.exp().float(), _curv.float())
+            obj_text_hyp = L.exp_map0(obj_text_tangent * self.textual_alpha.exp().float(), _curv.float())
 
-            verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
-            obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
+            verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv.float())
+            obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv.float())
 
         if self.training:
-            return verb_logits_eucl, obj_logits_eucl, verb_logits_hyp, obj_logits_hyp, p_pair_v, p_pair_o, video_features, o_feat, v_feat, p_v_con_o, p_o_con_v, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
+            # 极度精简的返回值
+            return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
+            # 【核心变革】: 测试期直接用双曲分数的矩阵索引相加！
+            # verb_idx 提取每个组合对应的动词分数，obj_idx 提取对应的物品分数
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-            com_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
+            com_logits = verb_logits_hyp[:, verb_idx] + obj_logits_hyp[:, obj_idx]
             return com_logits
-
-    def condition_module(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
-        # [彻底封死欧式推理区溢出]
-        v_emb_normed = torch.nan_to_num(F.normalize(v_emb, dim=1, eps=1e-5))
-        o_emb_normed = torch.nan_to_num(F.normalize(o_emb, dim=1, eps=1e-5))
-
-        f_v_e_o = self.c2c_f_v_e_o_com(
-            torch.cat([v_feat_c.unsqueeze(1).repeat(1, n_o, 1), o_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2)) 
-        f_v_e_o_norm = torch.nan_to_num(F.normalize(f_v_e_o, dim=-1, eps=1e-5)).view(b, n_o, c)
-
-        f_o_e_v = self.c2c_f_o_e_v_com(
-            torch.cat([o_feat_c.unsqueeze(1).repeat(1, n_v, 1), v_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2)) 
-        f_o_e_v_norm = torch.nan_to_num(F.normalize(f_o_e_v, dim=-1, eps=1e-5)).view(b, n_v, c)
-
-        p_v_con_o = torch.einsum('bnc,mc->bnm', f_v_e_o_norm, v_emb_normed) * 0.5 + 0.5  
-        p_v_con_o = p_v_con_o.permute(0, 2, 1)  
-        p_o_con_v = torch.einsum('bnc,mc->bnm', f_o_e_v_norm, o_emb_normed) * 0.5 + 0.5  
-        
-        return torch.nan_to_num(p_v_con_o), torch.nan_to_num(p_o_con_v)
 
 
 def load_clip_to_cpu(cfg):
@@ -266,7 +225,7 @@ def build_model(train_dataset,cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP")
+    print("Building custom CLIP (Pure Hyperbolic Version)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     print("Turning off gradients in both the image and the text encoder")
     for name, param in model.named_parameters():

@@ -40,9 +40,7 @@ class MLP(nn.Module):
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
-                # mod.append(nn.BatchNorm1d(outgoing))
             mod.append(nn.ReLU(inplace=True))
-            # mod.append(nn.LeakyReLU(inplace=True, negative_slope=0.2))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
 
@@ -50,7 +48,6 @@ class MLP(nn.Module):
 
         if relu:
             mod.append(nn.ReLU(inplace=True))
-            # mod.append(nn.LeakyReLU(inplace=True, negative_slope=0.2))
         self.mod = nn.Sequential(*mod)
 
     def forward(self, x):
@@ -77,24 +74,19 @@ class MLP_ST(nn.Module):
                 outgoing = incoming
             else:
                 outgoing = layers[layer_ind]
-            # mod.append(nn.Linear(incoming, outgoing, bias=bias))
             mod.append(nn.Conv1d(incoming, outgoing, kernel_size=3, bias=bias, padding=1))
 
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
-                # mod.append(nn.BatchNorm1d(outgoing))
             mod.append(nn.ReLU(inplace=True))
-            # mod.append(nn.LeakyReLU(inplace=True, negative_slope=0.2))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
 
-        # mod.append(nn.Linear(incoming, out_dim, bias=bias))
         mod.append(nn.Conv1d(incoming, out_dim, kernel_size=3, bias=bias, padding=1))
 
         if relu:
             mod.append(nn.ReLU(inplace=True))
-            # mod.append(nn.LeakyReLU(inplace=True, negative_slope=0.2))
         self.mod = nn.Sequential(*mod)
 
     def forward(self, x):
@@ -134,15 +126,13 @@ class VideoEncoder(nn.Module):
         from models.vlm_models.AIM import get_aim
         self.visual = get_aim(cfg)
         self.clip_proj = clip_model.visual.proj
-
-        self.num_frames=cfg.num_frames
+        self.num_frames = cfg.num_frames
 
     def forward(self, x):
         out = self.visual(x)
         if self.clip_proj is not None:
             out = out @ self.clip_proj
-        out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)#be annotated
-
+        out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)
         return out
 
 
@@ -160,17 +150,13 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
-        # self.dtype = clip_model.dtype
 
         # ======== Hyperbolic parameters initialization ========
-        # Initialize learnable curvature parameter.
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
-        # Min and max limits for curvature to ensure training stability
         self._curv_minmax = {
             "max": math.log(10.0),
             "min": math.log(0.1),
         }
-        # Learnable scalars to ensure unit norm before exponential map
         self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim**-0.5).log())
         self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim**-0.5).log())
         # ====================================================
@@ -185,38 +171,35 @@ class CustomCLIP(nn.Module):
             a = int(a)
             layers.append(a)
 
-        self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False,
-                           norm=True, layers=layers)
+        self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
+        self.c2c_OE2 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
+        self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
+        self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
-        self.c2c_OE2 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False,
-                           norm=True, layers=layers)
+        self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
+        self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
 
-        self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False,
-                              norm=True, layers=layers)
+        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
+        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False,
-                              norm=True, layers=layers)
-
-        self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)  # TODO
-        self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)  # TODO
-
-        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)  # TODO
-        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)  # TODO
+        # ======== [新增] 双曲切空间投影头 (Tangent Projectors) ========
+        # 彻底隔离欧式和双曲的几何冲突，保护 C2C 欧式基线特征！
+        self.hyp_proj_v_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+        self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+        self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+        self.hyp_proj_o_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+        # ===============================================================
 
     def forward(self, video, pairs=None):
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
-        verb_text_features=self.c2c_text_v(verb_text_features)
+        verb_text_features = self.c2c_text_v(verb_text_features)
 
         obj_prompts = self.obj_prompt_learner()
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
-        obj_text_features=self.c2c_text_o(obj_text_features)
+        obj_text_features = self.c2c_text_o(obj_text_features)
 
-        video_features = self.video_encoder(video)# b d t
+        video_features = self.video_encoder(video) # b d t
 
         # independent learning
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))  # b,c
@@ -225,11 +208,10 @@ class CustomCLIP(nn.Module):
         v_feat = v_feat_t.mean(dim=-1)  # b,c
         v_feat_normed = F.normalize(v_feat, dim=1)
 
-        # video_features = video_features / video_features.norm(dim=-1, keepdim=True)
         verb_text_features_norm = verb_text_features / verb_text_features.norm(dim=-1, keepdim=True)
         obj_text_features_norm = obj_text_features / obj_text_features.norm(dim=-1, keepdim=True)
 
-        # Euclidean logits (preserved strictly for the condition module to maintain baseline logic)
+        # ======== 欧式基线保留区 (完全不动，保留纯正的 C2C 逻辑) ========
         verb_logits_eucl = v_feat_normed @ verb_text_features_norm.t()
         obj_logits_eucl = o_feat_normed @ obj_text_features_norm.t()
 
@@ -247,35 +229,39 @@ class CustomCLIP(nn.Module):
         v_feat_c = self.c2c_VE2(video_features)
         v_feat_c = v_feat_c.mean(dim=-1)
 
-        p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b,
-                                                     c, n_v)
+        p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b, c, n_v)
         
-        # Use Euclidean probability logits for pair generation to preserve C2C foundation
+        # 使用纯欧式的概率生成组合概率矩阵 (保住性能下限)
         p_pair_o = p_v_con_o * obj_logits_prob.unsqueeze(1)  # b,nv,no
         p_pair_v = p_o_con_v * verb_logits_prob.unsqueeze(-1)  # b,nv,no
 
-        # ======== Hyperbolic Mapping and Distances ========
-        # Clamp curvature and scale factors
+        # ======== 双曲迁移区 (引入切空间投影，防止几何污染) ========
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
         self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
         self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
 
         with torch.autocast(video_features.device.type, dtype=torch.float32):
-            # Scale features and map to Hyperbolic space (Lorentz Model)
-            v_feat_hyp = L.exp_map0(v_feat * self.visual_alpha.exp(), _curv)
-            o_feat_hyp = L.exp_map0(o_feat * self.visual_alpha.exp(), _curv)
-            verb_text_hyp = L.exp_map0(verb_text_features * self.textual_alpha.exp(), _curv)
-            obj_text_hyp = L.exp_map0(obj_text_features * self.textual_alpha.exp(), _curv)
+            # 1. 经过切空间投影头，完成流形转换过渡
+            v_feat_tangent = self.hyp_proj_v_vis(v_feat.float())
+            o_feat_tangent = self.hyp_proj_o_vis(o_feat.float())
+            verb_text_tangent = self.hyp_proj_v_text(verb_text_features.float())
+            obj_text_tangent = self.hyp_proj_o_text(obj_text_features.float())
 
-            # Compute Hyperbolic Logits (Negative Distance)
+            # 2. 指数映射到洛伦兹模型
+            v_feat_hyp = L.exp_map0(v_feat_tangent * self.visual_alpha.exp().float(), _curv)
+            o_feat_hyp = L.exp_map0(o_feat_tangent * self.visual_alpha.exp().float(), _curv)
+            verb_text_hyp = L.exp_map0(verb_text_tangent * self.textual_alpha.exp().float(), _curv)
+            obj_text_hyp = L.exp_map0(obj_text_tangent * self.textual_alpha.exp().float(), _curv)
+
+            # 3. 计算双曲负距离
             verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
             obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
         # ====================================================
 
         if self.training:
-            # Return hyp logits for basic contrastive loss, and output hyp features for later hierarchical loss
-            return verb_logits_hyp, obj_logits_hyp, p_pair_v, p_pair_o, video_features, o_feat, v_feat, p_v_con_o, p_o_con_v, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
+            # 必须同时返回 欧式Logits(保基线) 和 双曲Logits(增强正则)
+            return verb_logits_eucl, obj_logits_eucl, verb_logits_hyp, obj_logits_hyp, p_pair_v, p_pair_o, video_features, o_feat, v_feat, p_v_con_o, p_o_con_v, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
@@ -287,13 +273,13 @@ class CustomCLIP(nn.Module):
 
         f_v_e_o = self.c2c_f_v_e_o_com(
             torch.cat([v_feat_c.unsqueeze(1).repeat(1, n_o, 1), o_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1,
-                                                                                                                  c * 2))  # b,1,c+1,n,c -->b,n,c*2--->b,no,c
+                                                                                                                  c * 2)) 
         f_v_e_o_norm = F.normalize(f_v_e_o, dim=-1)
         f_v_e_o_norm = f_v_e_o_norm.view(b, n_o, c)
 
         f_o_e_v = self.c2c_f_o_e_v_com(
             torch.cat([o_feat_c.unsqueeze(1).repeat(1, n_v, 1), v_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1,
-                                                                                                                  c * 2))  # b,1,c+1,n,c -->b,n,c*2--->b,nv,c
+                                                                                                                  c * 2)) 
         f_o_e_v_norm = F.normalize(f_o_e_v, dim=-1)
         f_o_e_v_norm = f_o_e_v_norm.view(b, n_v, c)
 
@@ -336,9 +322,6 @@ def build_model(train_dataset,cfg):
         param.requires_grad_(False)
         if "prompt_learner" in name:
             if cfg.learn_input_method != 'zero':
-                # if 'positional_embedding' in name:
-                #     param.requires_grad_(True)
-                #     print(f'{name}: {param.requires_grad}')
                 if cfg.learn_input_method == 'coop':
                     if 'prompt_vectors' in name:
                         param.requires_grad_(True)
@@ -357,7 +340,8 @@ def build_model(train_dataset,cfg):
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
                 print(f'{name}: {param.requires_grad}')
-        elif 'c2c' in name or 'curv' in name or 'alpha' in name: # Added curv and alpha to ensure they get updated
+        # ======== [新增] hyp_proj 添加到可更新参数列表 ========
+        elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name:
             param.requires_grad = True
             print(f'{name}: {param.requires_grad}')
     return model

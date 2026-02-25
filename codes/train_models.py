@@ -202,8 +202,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 v_alpha_fp32 = actual_model.textual_alpha.exp().float()
                 
                 # [关键修复] 粗粒度特征必须经过相同的切空间投影头，防止几何冲突
-                coarse_v_tangent = actual_model.hyp_proj_v_text(coarse_v_eucl.float())
-                coarse_o_tangent = actual_model.hyp_proj_o_text(coarse_o_eucl.float())
+                coarse_v_eucl_norm = coarse_v_eucl.float() / (coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-7)
+                coarse_o_eucl_norm = coarse_o_eucl.float() / (coarse_o_eucl.float().norm(dim=-1, keepdim=True) + 1e-7)
+                
+                coarse_v_tangent = actual_model.hyp_proj_v_text(coarse_v_eucl_norm)
+                coarse_o_tangent = actual_model.hyp_proj_o_text(coarse_o_eucl_norm)
                 
                 import models.vlm_models.lorentz as L
                 coarse_v_hyp = L.exp_map0(coarse_v_tangent * v_alpha_fp32, _curv_fp32)

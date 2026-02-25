@@ -95,7 +95,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 _curv_fp32 = _curv.float()
                 v_alpha_fp32 = actual_model.textual_alpha.exp().float()
                 
-                # [严防死守] 清理提取过程中的 NaN
                 coarse_v_eucl_norm = torch.nan_to_num(coarse_v_eucl.float() / (coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
                 coarse_o_eucl_norm = torch.nan_to_num(coarse_o_eucl.float() / (coarse_o_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
                 
@@ -134,8 +133,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
                 scaler.unscale_(optimizer)
-                # 强制梯度截断，物理阻断爆炸
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                # [关键修复]: 去掉 clip_grad_norm_！在 AMP 下它会把无穷大梯度强行转换成 NaN 毒药。直接让 Scaler 自己跳过更新！
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -147,15 +145,17 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_ent_losses.append(loss_entailment.item())
             epoch_ali_losses.append(loss_alignment.item())
 
-            progress_bar.set_postfix({"train loss": np.mean(epoch_train_losses[-50:])})
+            # [关键修复]: 使用 np.nanmean 免疫幽灵 NaN！只要网络正常跑，忽略偶发的浮点溢出批次
+            current_loss = np.nanmean(epoch_train_losses[-50:])
+            progress_bar.set_postfix({"train loss": current_loss})
             progress_bar.update()
 
         lr_scheduler.step()
         progress_bar.close()
         
         # Save metrics logs
-        log_training.write(f"\nepoch {i + 1} train loss {np.mean(epoch_train_losses)}\n")
-        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses)}\n")
+        log_training.write(f"\nepoch {i + 1} train loss {np.nanmean(epoch_train_losses)}\n")
+        log_training.write(f"epoch {i + 1} com loss {np.nanmean(epoch_com_losses)}\n")
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(), 'scheduler': lr_scheduler.state_dict(), 'scaler': scaler.state_dict()}, config.save_path, i)

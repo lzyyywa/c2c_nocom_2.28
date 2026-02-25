@@ -84,3 +84,7 @@ loss_weights:
   att_obj_w: 0.2
   lambda_align: 1.0
   lambda_entail: 0.1
+
+  align_margin:0.2
+  entail_margin:0.01
+  hyp_temp:20

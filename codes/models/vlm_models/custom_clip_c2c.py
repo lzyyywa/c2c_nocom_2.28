@@ -189,6 +189,14 @@ class CustomCLIP(nn.Module):
         self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_o_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         # ===============================================================
+        nn.init.eye_(self.hyp_proj_v_vis.weight)
+        nn.init.zeros_(self.hyp_proj_v_vis.bias)
+        nn.init.eye_(self.hyp_proj_o_vis.weight)
+        nn.init.zeros_(self.hyp_proj_o_vis.bias)
+        nn.init.eye_(self.hyp_proj_v_text.weight)
+        nn.init.zeros_(self.hyp_proj_v_text.bias)
+        nn.init.eye_(self.hyp_proj_o_text.weight)
+        nn.init.zeros_(self.hyp_proj_o_text.bias)
 
     def forward(self, video, pairs=None):
         verb_prompts = self.verb_prompt_learner()

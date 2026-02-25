@@ -3,15 +3,11 @@ import random
 from torch.utils.data.dataloader import DataLoader
 import tqdm
 import test as test
-from loss import EntailmentConeLoss, HyperbolicHardNegativeAlignmentLoss, KLLoss
+from loss import EntailmentConeLoss, HyperbolicHardNegativeAlignmentLoss
 from torch.nn.modules.loss import CrossEntropyLoss
 import torch.multiprocessing
 import numpy as np
 import json
-import math
-from utils.ade_utils import emd_inference_opencv_test
-from collections import Counter
-from utils.hsic import hsic_normalized_cca
 from clip import clip
 
 def evaluate(model, dataset, config):
@@ -74,16 +70,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_verb, batch_obj, batch_target = batch[1].cuda(), batch[2].cuda(), batch[3].cuda()
             batch_coarse_verb, batch_coarse_obj = batch[4], batch[5]
 
+            # 1. AMP 半精度跑 Backbone
             with torch.cuda.amp.autocast(enabled=True):
-                verb_logits_eucl, obj_logits_eucl, verb_logits_hyp, obj_logits_hyp, p_pair_v, p_pair_o, vid_feat, o_feat, v_feat, p_v_con_o, p_o_con_v, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
-                
-                loss_verb_eucl = Loss_fn(verb_logits_eucl * config.cosine_scale, batch_verb)
-                loss_obj_eucl = Loss_fn(obj_logits_eucl * config.cosine_scale, batch_obj)
-                
-                pred_com_train = (p_pair_v + p_pair_o)[:, train_pairs[:, 0], train_pairs[:, 1]]
-                loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
-                
-                loss_eucl_base = loss_com + config.att_obj_w * (loss_verb_eucl + loss_obj_eucl)
+                verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
                 coarse_v_raw = torch.cat([coarse_v_feats_dict[cv] for cv in batch_coarse_verb], dim=0).cuda()
                 coarse_o_raw = torch.cat([coarse_o_feats_dict[co] for co in batch_coarse_obj], dim=0).cuda()
@@ -91,9 +80,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 coarse_v_eucl = actual_model.c2c_text_v(coarse_v_raw)
                 coarse_o_eucl = actual_model.c2c_text_o(coarse_o_raw)
                 
+            # 2. 强制 FP32 计算双曲法则
             with torch.cuda.amp.autocast(enabled=False):
                 _curv_fp32 = _curv.float()
-                v_alpha_fp32 = actual_model.visual_alpha.exp().float()
                 t_alpha_fp32 = actual_model.textual_alpha.exp().float()
                 
                 coarse_v_eucl_norm = torch.nan_to_num(coarse_v_eucl.float() / (coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
@@ -103,55 +92,68 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 coarse_o_tangent = actual_model.hyp_proj_o_text(coarse_o_eucl_norm)
                 
                 import models.vlm_models.lorentz as L
-                # [必须用 t_alpha_fp32 处理文本]
                 coarse_v_hyp = L.exp_map0(coarse_v_tangent * t_alpha_fp32, _curv_fp32)
                 coarse_o_hyp = L.exp_map0(coarse_o_tangent * t_alpha_fp32, _curv_fp32)
                 
-                batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
-                batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
-                v_feat_hyp_fp32, o_feat_hyp_fp32 = v_feat_hyp.float(), o_feat_hyp.float()
+                # ====== 动态读取配置参数 ======
+                w_att_obj = getattr(config, 'att_obj_w', 0.2)
+                w_entail = getattr(config, 'lambda_entail', getattr(config, 'w_entail', 0.1))
+                w_align = getattr(config, 'lambda_align', getattr(config, 'w_align', 1.0))
+                align_margin = getattr(config, 'align_margin', 0.2)
+                entail_margin = getattr(config, 'entail_margin', 0.01)
+                hyp_temp = getattr(config, 'hyp_temp', 20.0)
+
+                entail_loss_fn = EntailmentConeLoss(margin=entail_margin)
+                align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
                 
-                entail_loss_fn = EntailmentConeLoss(margin=0.01)
-                align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=0.2)
+                # ==============================================================
+                # 【核心逻辑】：纯双曲分数的组合！
+                # 动词双曲分数 + 物品双曲分数 = 组合动作双曲分数
+                # ==============================================================
+                train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
+                pred_com_train = verb_logits_hyp[:, train_v_inds] + obj_logits_hyp[:, train_o_inds]
                 
-                loss_ent_v = entail_loss_fn(batch_fine_v_hyp, coarse_v_hyp, _curv_fp32)
-                loss_ent_o = entail_loss_fn(batch_fine_o_hyp, coarse_o_hyp, _curv_fp32)
-                loss_ent_vid_v = entail_loss_fn(v_feat_hyp_fp32, batch_fine_v_hyp, _curv_fp32)
-                loss_ent_vid_o = entail_loss_fn(o_feat_hyp_fp32, batch_fine_o_hyp, _curv_fp32)
-                loss_entailment = loss_ent_v + loss_ent_o + loss_ent_vid_v + loss_ent_vid_o
+                # 双曲空间的 CrossEntropy
+                loss_com = Loss_fn(pred_com_train * hyp_temp, batch_target)
+                loss_verb_hyp = Loss_fn(verb_logits_hyp * hyp_temp, batch_verb)
+                loss_obj_hyp = Loss_fn(obj_logits_hyp * hyp_temp, batch_obj)
                 
-                loss_align_v = align_loss_fn(verb_logits_hyp.float(), batch_verb)
-                loss_align_o = align_loss_fn(obj_logits_hyp.float(), batch_obj)
+                # 判别对齐
+                loss_align_v = align_loss_fn(verb_logits_hyp, batch_verb)
+                loss_align_o = align_loss_fn(obj_logits_hyp, batch_obj)
                 loss_alignment = loss_align_v + loss_align_o
                 
-                loss_verb_hyp = Loss_fn(verb_logits_hyp.float() * 20.0, batch_verb)
-                loss_obj_hyp = Loss_fn(obj_logits_hyp.float() * 20.0, batch_obj)
+                # 层次蕴含
+                batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
+                batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
+                loss_ent_v = entail_loss_fn(batch_fine_v_hyp, coarse_v_hyp, _curv_fp32)
+                loss_ent_o = entail_loss_fn(batch_fine_o_hyp, coarse_o_hyp, _curv_fp32)
+                loss_ent_vid_v = entail_loss_fn(v_feat_hyp.float(), batch_fine_v_hyp, _curv_fp32)
+                loss_ent_vid_o = entail_loss_fn(o_feat_hyp.float(), batch_fine_o_hyp, _curv_fp32)
+                loss_entailment = loss_ent_v + loss_ent_o + loss_ent_vid_v + loss_ent_vid_o
                 
-                loss_hyp_aux = config.att_obj_w * (loss_verb_hyp + loss_obj_hyp) + config.lambda_entail * loss_entailment + config.lambda_align * loss_alignment
+                # 【统一流形总损失】：完全抛弃欧式特征计算，全盘双曲化！
+                loss = loss_com + w_att_obj * (loss_verb_hyp + loss_obj_hyp) + w_entail * loss_entailment + w_align * loss_alignment
                 
-                # [终极防弹衣]: 在反向传播前，清洗一切可能溢出的浮点数！
-                loss = (torch.nan_to_num(loss_eucl_base) + torch.nan_to_num(loss_hyp_aux)) / config.gradient_accumulation_steps
-                loss = torch.nan_to_num(loss)
+                loss = torch.nan_to_num(loss) / config.gradient_accumulation_steps
 
             scaler.scale(loss).backward()
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
                 scaler.unscale_(optimizer)
-                # =========================================================================
-                # 【罪魁祸首已斩首】 删除了导致 inf * 0 = NaN 的 clip_grad_norm_！
-                # =========================================================================
+                # 删除了 clip_grad_norm_ 保障安全
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
             epoch_train_losses.append(loss.item())
             epoch_com_losses.append(loss_com.item())
-            epoch_vv_losses.append(loss_verb_eucl.item())
-            epoch_oo_losses.append(loss_obj_eucl.item())
+            # 记录的也是纯双曲的基础 Loss
+            epoch_vv_losses.append(loss_verb_hyp.item())
+            epoch_oo_losses.append(loss_obj_hyp.item())
             epoch_ent_losses.append(loss_entailment.item())
             epoch_ali_losses.append(loss_alignment.item())
 
-            # 屏蔽由于 AMP 跳过更新时产生的幽灵孤立 NaN
             current_loss = np.nanmean(epoch_train_losses[-50:])
             progress_bar.set_postfix({"train loss": current_loss})
             progress_bar.update()

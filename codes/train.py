@@ -11,7 +11,7 @@ import yaml
 import shutil
 from utils.get_optimizer import get_optimizer
 from utils import CosineAnnealingLR
-from loss import KLLoss
+
 import torch.multiprocessing
 
 torch.multiprocessing.set_sharing_strategy('file_system')

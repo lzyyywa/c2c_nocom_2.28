@@ -45,14 +45,14 @@ class EntailmentConeLoss(nn.Module):
 
 class HyperbolicHardNegativeAlignmentLoss(nn.Module):
     """
-    【双曲判别对齐损失】(Discriminative Alignment with Hard Negative Mining)
-    严格按照论文公式: L = max(0, d(v, t^+) - d(v, t^-_{hard}) + margin)
+    【双曲语义级判别对齐损失】(Semantic Discriminative Alignment)
+    完全对齐 H2EM/HyCoCLIP 思想：在共享粗粒度语义 (Coarse-level) 的难负样本集中进行排斥。
     """
     def __init__(self, margin=0.2):
         super().__init__()
         self.margin = margin
 
-    def forward(self, logits, labels):
+    def forward(self, logits, labels, hard_mask=None):
         # logits 是模型输出的双曲负距离 (-dist)
         # 还原为真实的双曲黎曼距离 d(x, y)
         dists = -logits
@@ -60,13 +60,19 @@ class HyperbolicHardNegativeAlignmentLoss(nn.Module):
         # 1. 获取正确的正样本对距离 d(v, t^+)
         pos_dists = dists.gather(1, labels.view(-1, 1))
         
-        # 2. 寻找最难负样本对距离 d(v, t^-_{hard}) 
-        # (即除了正确标签外，距离当前视频最近的那个错误类别)
-        mask = torch.ones_like(dists, dtype=torch.bool)
-        mask.scatter_(1, labels.view(-1, 1), False) # 把正确标签位置屏蔽掉
+        # 2. 确定候选的负样本集合
+        if hard_mask is None:
+            # 如果不传 mask，回退到全局难负样本 (Global Hard Negative)
+            mask = torch.ones_like(dists, dtype=torch.bool)
+            mask.scatter_(1, labels.view(-1, 1), False)
+        else:
+            # [核心逻辑]：使用传入的语义难负样本 Mask！(只考虑同粗类下的其他细类)
+            mask = hard_mask
         
-        # 将正样本距离设为无穷大，从而在取 min 时绝对只选出负样本
+        # 将不允许作为负样本的位置设为无穷大，这样在取 min 时绝对不会选中它们
         neg_dists_only = dists.masked_fill(~mask, float('inf'))
+        
+        # 寻找“语义簇内”最难的那个负样本
         hard_neg_dists, _ = neg_dists_only.min(dim=1, keepdim=True)
         
         # 3. Triplet Margin 公式计算排斥力

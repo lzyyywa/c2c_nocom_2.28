@@ -153,26 +153,52 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             with torch.cuda.amp.autocast(enabled=True):
                 verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
-                # 直接提取全表(所有的)粗粒度特征，计算效率极大提升
-                all_coarse_v_eucl = actual_model.c2c_text_v(all_coarse_v_raw)
-                all_coarse_o_eucl = actual_model.c2c_text_o(all_coarse_o_raw)
+                if use_frozen_coarse:
+                    # 直接提取全表(所有的)粗粒度特征
+                    all_coarse_v_eucl = actual_model.c2c_text_v(all_coarse_v_raw)
+                    all_coarse_o_eucl = actual_model.c2c_text_o(all_coarse_o_raw)
                 
             # 2. 强制 FP32 计算双曲法则
             with torch.cuda.amp.autocast(enabled=False):
                 _curv_fp32 = _curv.float()
                 t_alpha_fp32 = actual_model.textual_alpha.exp().float()
                 
-                # 安全归一化全局特征
-                all_coarse_v_eucl_norm = torch.nan_to_num(all_coarse_v_eucl.float() / (all_coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
-                all_coarse_o_eucl_norm = torch.nan_to_num(all_coarse_o_eucl.float() / (all_coarse_o_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
-                
-                all_coarse_v_tangent = actual_model.hyp_proj_v_text(all_coarse_v_eucl_norm)
-                all_coarse_o_tangent = actual_model.hyp_proj_o_text(all_coarse_o_eucl_norm)
-                
                 import models.vlm_models.lorentz as L
-                # 得到全局唯一的粗粒度双曲节点
-                all_coarse_v_hyp = L.exp_map0(all_coarse_v_tangent * t_alpha_fp32, _curv_fp32)
-                all_coarse_o_hyp = L.exp_map0(all_coarse_o_tangent * t_alpha_fp32, _curv_fp32)
+                if use_frozen_coarse:
+                    # 安全归一化全局特征
+                    all_coarse_v_eucl_norm = torch.nan_to_num(all_coarse_v_eucl.float() / (all_coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
+                    all_coarse_o_eucl_norm = torch.nan_to_num(all_coarse_o_eucl.float() / (all_coarse_o_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
+
+                    all_coarse_v_tangent = actual_model.hyp_proj_v_text(all_coarse_v_eucl_norm)
+                    all_coarse_o_tangent = actual_model.hyp_proj_o_text(all_coarse_o_eucl_norm)
+
+                    # 得到全局唯一的粗粒度双曲节点
+                    all_coarse_v_hyp = L.exp_map0(all_coarse_v_tangent * t_alpha_fp32, _curv_fp32)
+                    all_coarse_o_hyp = L.exp_map0(all_coarse_o_tangent * t_alpha_fp32, _curv_fp32)
+                else:
+                    # 用 fine 文本双曲点 log_map0 到切空间做均值，得到 coarse 父节点（同一编码分布，更稳）
+                    v_child_scaled_tangent = L.log_map0(verb_text_hyp.float(), _curv_fp32)
+                    o_child_scaled_tangent = L.log_map0(obj_text_hyp.float(), _curv_fp32)
+
+                    all_coarse_v_scaled = torch.zeros(
+                        (len(unique_coarse_verbs), v_child_scaled_tangent.shape[-1]),
+                        device=v_child_scaled_tangent.device,
+                        dtype=v_child_scaled_tangent.dtype,
+                    )
+                    all_coarse_o_scaled = torch.zeros(
+                        (len(unique_coarse_objs), o_child_scaled_tangent.shape[-1]),
+                        device=o_child_scaled_tangent.device,
+                        dtype=o_child_scaled_tangent.dtype,
+                    )
+
+                    all_coarse_v_scaled.index_add_(0, fine2coarse_v_idx, v_child_scaled_tangent)
+                    all_coarse_o_scaled.index_add_(0, fine2coarse_o_idx, o_child_scaled_tangent)
+
+                    all_coarse_v_scaled = all_coarse_v_scaled / coarse_v_counts.to(all_coarse_v_scaled.device).unsqueeze(1)
+                    all_coarse_o_scaled = all_coarse_o_scaled / coarse_o_counts.to(all_coarse_o_scaled.device).unsqueeze(1)
+
+                    all_coarse_v_hyp = L.exp_map0(all_coarse_v_scaled, _curv_fp32)
+                    all_coarse_o_hyp = L.exp_map0(all_coarse_o_scaled, _curv_fp32)
                 
                 # ====== 动态读取配置参数 ======
                 w_att_obj = getattr(config, 'att_obj_w', 0.2)

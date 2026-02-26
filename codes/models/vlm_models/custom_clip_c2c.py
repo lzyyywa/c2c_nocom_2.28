@@ -115,20 +115,20 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
 
+        # 严格对齐 MERU/HyCoCLIP 的曲率初始化和限制
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
         self._curv_minmax = {"max": math.log(10.0), "min": math.log(0.1)}
         
-        # 释放 alpha 黑洞坍缩限制，允许模型在需要时拉开特征间距
-        self.visual_alpha = nn.Parameter(torch.tensor(0.0))
-        self.textual_alpha = nn.Parameter(torch.tensor(0.0))
+        # ==============================================================
+        # [严格遵循 MERU 官方设定]: 初始 Alpha 设为 embed_dim 的负半次方对数
+        # 保证经过指数映射前特征期望的 L2 Norm 为 1，完美防止大爆炸！
+        # ==============================================================
+        self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
+        self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
         
-        # ==============================================================
-        # 【纯双曲王道：模态专属可学习尺度 (Learnable Modality Scale)】
-        # 让神经网络自己在反向传播中寻找 Verb 和 Obj 距离权重的绝对平衡！
-        # 初始化为 ln(20.0) 给出基础温度
-        # ==============================================================
-        self.logit_scale_v = nn.Parameter(torch.tensor(math.log(20.0)))
-        self.logit_scale_o = nn.Parameter(torch.tensor(math.log(20.0)))
+        # 初始设为类似 CLIP 的尺度，但在 forward 中强制限制最大值
+        self.logit_scale_v = nn.Parameter(torch.tensor(1 / 0.07).log())
+        self.logit_scale_o = nn.Parameter(torch.tensor(1 / 0.07).log())
 
         try:
             fc_emb = cfg.fc_emb.split(',')
@@ -136,7 +136,6 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
-        # 仅保留纯特征提取器，摒弃欧式条件组合网络
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
@@ -172,37 +171,45 @@ class CustomCLIP(nn.Module):
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        o_feat_normed = torch.nan_to_num(F.normalize(o_feat, dim=1, eps=1e-5))
-        v_feat_normed = torch.nan_to_num(F.normalize(v_feat, dim=1, eps=1e-5))
-        verb_text_features_norm = torch.nan_to_num(verb_text_features / (verb_text_features.norm(dim=-1, keepdim=True) + 1e-5))
-        obj_text_features_norm = torch.nan_to_num(obj_text_features / (obj_text_features.norm(dim=-1, keepdim=True) + 1e-5))
+        # 获取原始特征 (不加 F.normalize 破坏相对长度结构)
+        o_feat_raw = torch.nan_to_num(o_feat)
+        v_feat_raw = torch.nan_to_num(v_feat)
+        verb_text_raw = torch.nan_to_num(verb_text_features)
+        obj_text_raw = torch.nan_to_num(obj_text_features)
 
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
-        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, min=-5.0, max=5.0)
-        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, min=-5.0, max=5.0)
+        
+        # ==============================================================
+        # [严格遵循 MERU 官方设定]: 限制 alpha 最大为 0 (即特征最多放大 1.0 倍)
+        # ==============================================================
+        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
+        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
 
         with torch.autocast(video_features.device.type, dtype=torch.float32):
-            v_feat_tangent = self.hyp_proj_v_vis(v_feat_normed.float())
-            o_feat_tangent = self.hyp_proj_o_vis(o_feat_normed.float())
-            verb_text_tangent = self.hyp_proj_v_text(verb_text_features_norm.float())
-            obj_text_tangent = self.hyp_proj_o_text(obj_text_features_norm.float())
+            v_feat_tangent = self.hyp_proj_v_vis(v_feat_raw.float())
+            o_feat_tangent = self.hyp_proj_o_vis(o_feat_raw.float())
+            verb_text_tangent = self.hyp_proj_v_text(verb_text_raw.float())
+            obj_text_tangent = self.hyp_proj_o_text(obj_text_raw.float())
 
-            v_feat_hyp = L.exp_map0(v_feat_tangent * self.visual_alpha.exp().float(), _curv.float())
-            o_feat_hyp = L.exp_map0(o_feat_tangent * self.visual_alpha.exp().float(), _curv.float())
-            verb_text_hyp = L.exp_map0(verb_text_tangent * self.textual_alpha.exp().float(), _curv.float())
-            obj_text_hyp = L.exp_map0(obj_text_tangent * self.textual_alpha.exp().float(), _curv.float())
+            v_feat_hyp = L.exp_map0(v_feat_tangent * self.visual_alpha.exp(), _curv)
+            o_feat_hyp = L.exp_map0(o_feat_tangent * self.visual_alpha.exp(), _curv)
+            verb_text_hyp = L.exp_map0(verb_text_tangent * self.textual_alpha.exp(), _curv)
+            obj_text_hyp = L.exp_map0(obj_text_tangent * self.textual_alpha.exp(), _curv)
 
-            verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv.float())
-            obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv.float())
+            verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
+            obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
 
         if self.training:
             return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
             # ==============================================================
-            # 【测试期】：使用网络自动学到的尺度放大真实的负距离！
-            # 不再使用破坏置信度的 Z-score！
+            # [严格遵循 MERU 官方设定]: Clamp temperature, ln(100) = ~4.6052
+            # 防止测试期间 Logit 极端放大
             # ==============================================================
+            self.logit_scale_v.data = torch.clamp(self.logit_scale_v.data, max=4.6052)
+            self.logit_scale_o.data = torch.clamp(self.logit_scale_o.data, max=4.6052)
+            
             verb_scaled = verb_logits_hyp * self.logit_scale_v.exp()
             obj_scaled = obj_logits_hyp * self.logit_scale_o.exp()
             
@@ -226,7 +233,7 @@ def build_model(train_dataset,cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Pure Hyperbolic Scale-Learnable Version)")
+    print("Building custom CLIP (Aligned with MERU/HyCoCLIP)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     print("Turning off gradients in both the image and the text encoder")
     for name, param in model.named_parameters():
@@ -241,7 +248,6 @@ def build_model(train_dataset,cfg):
                     param.requires_grad_(True)
         elif 'video_encoder' in name and ('temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name):
             param.requires_grad = True
-        # 【关键保护】：确保 logit_scale 能够获取梯度更新！
         elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name or 'logit_scale' in name:
             param.requires_grad = True
     return model

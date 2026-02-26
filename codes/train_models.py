@@ -30,22 +30,33 @@ def save_checkpoint(state, save_path, epoch, best=False):
 def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset, scaler):
     train_dataloader = DataLoader(train_dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
 
-    print("Pre-extracting coarse text Euclidean features using frozen CLIP...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    frozen_clip, _ = clip.load(config.backbone, device=device)
-    frozen_clip.eval()
-    
-    coarse_v_feats_dict, coarse_o_feats_dict = {}, {}
-    with torch.no_grad():
-        for cv in set(train_dataset.verb_hierarchy.values()):
-            tokens = clip.tokenize(f"an action of {cv}").cuda()
-            coarse_v_feats_dict[cv] = frozen_clip.encode_text(tokens).float()
-        for co in set(train_dataset.obj_hierarchy.values()):
-            tokens = clip.tokenize(f"a photo of a {co}").cuda()
-            coarse_o_feats_dict[co] = frozen_clip.encode_text(tokens).float()
-            
-    del frozen_clip
-    print("Pre-extraction complete.")
+    # coarse 父节点的来源：
+    # - "mean_children"(默认)：用当前批次下模型产生的 fine 文本嵌入，按层级把同父节点的 children 做 log-map 平均，得到父节点
+    # - "frozen_clip"：使用冻结 CLIP 直接编码 coarse 文本
+    coarse_parent_source = str(getattr(config, "coarse_parent_source", "mean_children")).lower()
+    use_frozen_coarse = coarse_parent_source in {"frozen_clip", "frozen", "clip"}
+
+    coarse_v_feats_dict, coarse_o_feats_dict = None, None
+    if use_frozen_coarse:
+        print("Pre-extracting coarse text Euclidean features using frozen CLIP...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        frozen_clip, _ = clip.load(config.backbone, device=device)
+        frozen_clip.eval()
+
+        coarse_v_feats_dict, coarse_o_feats_dict = {}, {}
+        with torch.no_grad():
+            for cv in set(train_dataset.verb_hierarchy.values()):
+                tokens = clip.tokenize(f"an action of {cv}").to(device)
+                # encode_text 输出通常是 (1, D)，这里 squeeze 掉多余维度，避免后续 stack 出现 (N,1,D) 导致隐式 broadcast
+                coarse_v_feats_dict[cv] = frozen_clip.encode_text(tokens).float().squeeze(0)
+            for co in set(train_dataset.obj_hierarchy.values()):
+                tokens = clip.tokenize(f"a photo of a {co}").to(device)
+                coarse_o_feats_dict[co] = frozen_clip.encode_text(tokens).float().squeeze(0)
+
+        del frozen_clip
+        print("Pre-extraction complete.")
+    else:
+        print("Coarse parents will be computed from mean of fine children (log-map mean).")
 
     model.train()
     best_loss = 1e5
@@ -62,43 +73,67 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     print("Building Semantic Hard Negative Masks and Global Tree Indices...")
     idx2attr = {v: k for k, v in attr2idx.items()}
     num_verbs = len(idx2attr)
+
+    # 仅将训练集中出现过的 primitive 作为负样本候选，避免把 unseen primitive 也强行推开（会显著伤害零样本）
+    train_verbs = set([a for (a, _) in train_dataset.train_pairs])
+    train_objs = set([o for (_, o) in train_dataset.train_pairs])
+    is_train_verb = torch.tensor([idx2attr[i] in train_verbs for i in range(num_verbs)], dtype=torch.bool)
+
     verb_hard_mask_matrix = torch.zeros((num_verbs, num_verbs), dtype=torch.bool)
     for i in range(num_verbs):
+        if not is_train_verb[i]:
+            continue
         coarse_i = train_dataset.verb_hierarchy[idx2attr[i]]
         for j in range(num_verbs):
-            if i != j and train_dataset.verb_hierarchy[idx2attr[j]] == coarse_i:
+            if i != j and is_train_verb[j] and train_dataset.verb_hierarchy[idx2attr[j]] == coarse_i:
                 verb_hard_mask_matrix[i, j] = True
         # 安全回退: 如果这个动作是孤立的(同簇无其他类别)，回退到全局负样本
         if not verb_hard_mask_matrix[i].any():
-            verb_hard_mask_matrix[i] = True
+            verb_hard_mask_matrix[i] = is_train_verb
             verb_hard_mask_matrix[i, i] = False
 
     idx2obj = {v: k for k, v in obj2idx.items()}
     num_objs = len(idx2obj)
+    is_train_obj = torch.tensor([idx2obj[i] in train_objs for i in range(num_objs)], dtype=torch.bool)
     obj_hard_mask_matrix = torch.zeros((num_objs, num_objs), dtype=torch.bool)
     for i in range(num_objs):
+        if not is_train_obj[i]:
+            continue
         coarse_i = train_dataset.obj_hierarchy[idx2obj[i]]
         for j in range(num_objs):
-            if i != j and train_dataset.obj_hierarchy[idx2obj[j]] == coarse_i:
+            if i != j and is_train_obj[j] and train_dataset.obj_hierarchy[idx2obj[j]] == coarse_i:
                 obj_hard_mask_matrix[i, j] = True
         if not obj_hard_mask_matrix[i].any():
-            obj_hard_mask_matrix[i] = True
+            obj_hard_mask_matrix[i] = is_train_obj
             obj_hard_mask_matrix[i, i] = False
 
     # ==============================================================
     # [新增结构 2]: 建立全局全词表的树状拓扑关系 (Global Vocabulary Tree)
     # 放弃 Batch-wise 抖动，直接对整棵文本树进行对齐！
     # ==============================================================
-    unique_coarse_verbs = list(set(train_dataset.verb_hierarchy.values()))
-    all_coarse_v_raw = torch.stack([coarse_v_feats_dict[cv] for cv in unique_coarse_verbs]).cuda()
+    unique_coarse_verbs = sorted(set(train_dataset.verb_hierarchy.values()))
+    if use_frozen_coarse:
+        all_coarse_v_raw = torch.stack([coarse_v_feats_dict[cv] for cv in unique_coarse_verbs]).cuda()
+    else:
+        all_coarse_v_raw = None
     # 建立从 细粒度ID 到 粗粒度唯一ID 的索引映射
     fine2coarse_v_idx = torch.tensor([unique_coarse_verbs.index(train_dataset.verb_hierarchy[idx2attr[i]]) for i in range(num_verbs)]).cuda()
+    coarse_v_counts = torch.bincount(fine2coarse_v_idx, minlength=len(unique_coarse_verbs)).float().clamp_min(1.0)
 
-    unique_coarse_objs = list(set(train_dataset.obj_hierarchy.values()))
-    all_coarse_o_raw = torch.stack([coarse_o_feats_dict[co] for co in unique_coarse_objs]).cuda()
+    unique_coarse_objs = sorted(set(train_dataset.obj_hierarchy.values()))
+    if use_frozen_coarse:
+        all_coarse_o_raw = torch.stack([coarse_o_feats_dict[co] for co in unique_coarse_objs]).cuda()
+    else:
+        all_coarse_o_raw = None
     fine2coarse_o_idx = torch.tensor([unique_coarse_objs.index(train_dataset.obj_hierarchy[idx2obj[i]]) for i in range(num_objs)]).cuda()
+    coarse_o_counts = torch.bincount(fine2coarse_o_idx, minlength=len(unique_coarse_objs)).float().clamp_min(1.0)
     print("Masks and Tree Built Successfully.")
     # ==============================================================
+
+    # hard negative mask 与后续 batch_* 索引需要在同一设备上
+    mask_device = train_pairs.device
+    verb_hard_mask_matrix = verb_hard_mask_matrix.to(mask_device)
+    obj_hard_mask_matrix = obj_hard_mask_matrix.to(mask_device)
 
     for i in range(config.epoch_start, config.epochs):
         progress_bar = tqdm.tqdm(total=len(train_dataloader), desc="epoch % 3d" % (i + 1))

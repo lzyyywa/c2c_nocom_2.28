@@ -38,7 +38,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.mod(x)
 
-
 class MLP_ST(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP_ST, self).__init__()
@@ -71,7 +70,6 @@ class MLP_ST(nn.Module):
                 x = o(x)
         return x
 
-
 class TextEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -90,7 +88,6 @@ class TextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
 
-
 class VideoEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -106,7 +103,6 @@ class VideoEncoder(nn.Module):
         out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)
         return out
 
-
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
@@ -121,8 +117,18 @@ class CustomCLIP(nn.Module):
 
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
         self._curv_minmax = {"max": math.log(10.0), "min": math.log(0.1)}
-        self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim**-0.5).log())
-        self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim**-0.5).log())
+        
+        # 释放 alpha 黑洞坍缩限制，允许模型在需要时拉开特征间距
+        self.visual_alpha = nn.Parameter(torch.tensor(0.0))
+        self.textual_alpha = nn.Parameter(torch.tensor(0.0))
+        
+        # ==============================================================
+        # 【纯双曲王道：模态专属可学习尺度 (Learnable Modality Scale)】
+        # 让神经网络自己在反向传播中寻找 Verb 和 Obj 距离权重的绝对平衡！
+        # 初始化为 ln(20.0) 给出基础温度
+        # ==============================================================
+        self.logit_scale_v = nn.Parameter(torch.tensor(math.log(20.0)))
+        self.logit_scale_o = nn.Parameter(torch.tensor(math.log(20.0)))
 
         try:
             fc_emb = cfg.fc_emb.split(',')
@@ -130,14 +136,13 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
-        # 仅保留基础的独立基元特征提取器 (彻底抛弃复杂的推断模块)
+        # 仅保留纯特征提取器，摒弃欧式条件组合网络
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # 双曲切空间投影头
         self.hyp_proj_v_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
@@ -153,7 +158,6 @@ class CustomCLIP(nn.Module):
         nn.init.zeros_(self.hyp_proj_o_text.bias)
 
     def forward(self, video, pairs=None):
-        # 1. 提取基础特征
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
         verb_text_features = self.c2c_text_v(verb_text_features)
@@ -168,22 +172,16 @@ class CustomCLIP(nn.Module):
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        # 2. 安全归一化防溢出
         o_feat_normed = torch.nan_to_num(F.normalize(o_feat, dim=1, eps=1e-5))
         v_feat_normed = torch.nan_to_num(F.normalize(v_feat, dim=1, eps=1e-5))
-
-        verb_text_features_norm = verb_text_features / (verb_text_features.norm(dim=-1, keepdim=True) + 1e-5)
-        verb_text_features_norm = torch.nan_to_num(verb_text_features_norm)
-        
-        obj_text_features_norm = obj_text_features / (obj_text_features.norm(dim=-1, keepdim=True) + 1e-5)
-        obj_text_features_norm = torch.nan_to_num(obj_text_features_norm)
+        verb_text_features_norm = torch.nan_to_num(verb_text_features / (verb_text_features.norm(dim=-1, keepdim=True) + 1e-5))
+        obj_text_features_norm = torch.nan_to_num(obj_text_features / (obj_text_features.norm(dim=-1, keepdim=True) + 1e-5))
 
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
-        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
-        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
+        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, min=-5.0, max=5.0)
+        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, min=-5.0, max=5.0)
 
-        # 3. 直通双曲空间！纯净计算距离
         with torch.autocast(video_features.device.type, dtype=torch.float32):
             v_feat_tangent = self.hyp_proj_v_vis(v_feat_normed.float())
             o_feat_tangent = self.hyp_proj_o_vis(o_feat_normed.float())
@@ -199,15 +197,18 @@ class CustomCLIP(nn.Module):
             obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv.float())
 
         if self.training:
-            # 极度精简的返回值
             return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
-            # 【核心变革】: 测试期直接用双曲分数的矩阵索引相加！
-            # verb_idx 提取每个组合对应的动词分数，obj_idx 提取对应的物品分数
+            # ==============================================================
+            # 【测试期】：使用网络自动学到的尺度放大真实的负距离！
+            # 不再使用破坏置信度的 Z-score！
+            # ==============================================================
+            verb_scaled = verb_logits_hyp * self.logit_scale_v.exp()
+            obj_scaled = obj_logits_hyp * self.logit_scale_o.exp()
+            
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-            com_logits = verb_logits_hyp[:, verb_idx] + obj_logits_hyp[:, obj_idx]
+            com_logits = verb_scaled[:, verb_idx] + obj_scaled[:, obj_idx]
             return com_logits
-
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone
@@ -225,7 +226,7 @@ def build_model(train_dataset,cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Pure Hyperbolic Version)")
+    print("Building custom CLIP (Pure Hyperbolic Scale-Learnable Version)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     print("Turning off gradients in both the image and the text encoder")
     for name, param in model.named_parameters():
@@ -240,6 +241,7 @@ def build_model(train_dataset,cfg):
                     param.requires_grad_(True)
         elif 'video_encoder' in name and ('temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name):
             param.requires_grad = True
-        elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name:
+        # 【关键保护】：确保 logit_scale 能够获取梯度更新！
+        elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name or 'logit_scale' in name:
             param.requires_grad = True
     return model

@@ -1,3 +1,5 @@
+import numpy as np
+import torch
 import random
 import os
 import pprint
@@ -13,6 +15,7 @@ from utils.get_optimizer import get_optimizer
 from utils import CosineAnnealingLR
 
 import torch.multiprocessing
+
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 

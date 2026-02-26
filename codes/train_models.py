@@ -30,29 +30,12 @@ def save_checkpoint(state, save_path, epoch, best=False):
 def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset, scaler):
     train_dataloader = DataLoader(train_dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
 
-    coarse_parent_source = str(getattr(config, "coarse_parent_source", "mean_children")).lower()
-    use_frozen_coarse = coarse_parent_source in {"frozen_clip", "frozen", "clip"}
-
-    coarse_v_feats_dict, coarse_o_feats_dict = None, None
-    if use_frozen_coarse:
-        print("Pre-extracting coarse text Euclidean features using frozen CLIP...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        frozen_clip, _ = clip.load(config.backbone, device=device)
-        frozen_clip.eval()
-
-        coarse_v_feats_dict, coarse_o_feats_dict = {}, {}
-        with torch.no_grad():
-            for cv in set(train_dataset.verb_hierarchy.values()):
-                tokens = clip.tokenize(f"an action of {cv}").to(device)
-                coarse_v_feats_dict[cv] = frozen_clip.encode_text(tokens).float().squeeze(0)
-            for co in set(train_dataset.obj_hierarchy.values()):
-                tokens = clip.tokenize(f"a photo of a {co}").to(device)
-                coarse_o_feats_dict[co] = frozen_clip.encode_text(tokens).float().squeeze(0)
-
-        del frozen_clip
-        print("Pre-extraction complete.")
-    else:
-        print("Coarse parents will be computed from mean of fine children (log-map mean).")
+    # ==============================================================
+    # [修改点1]：强制关闭 frozen_clip，强制走子节点切空间均值逻辑！
+    # 只有这样，父节点才会因为求均值而缩短范数，自动靠近原点，形成完美层级。
+    # ==============================================================
+    use_frozen_coarse = False
+    print("Forcing coarse parents to be computed from mean of fine children (log-map mean) to preserve hyperbolic hierarchy.")
 
     model.train()
     best_loss = 1e5
@@ -99,18 +82,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             obj_hard_mask_matrix[i, i] = False
 
     unique_coarse_verbs = sorted(set(train_dataset.verb_hierarchy.values()))
-    if use_frozen_coarse:
-        all_coarse_v_raw = torch.stack([coarse_v_feats_dict[cv] for cv in unique_coarse_verbs]).cuda()
-    else:
-        all_coarse_v_raw = None
     fine2coarse_v_idx = torch.tensor([unique_coarse_verbs.index(train_dataset.verb_hierarchy[idx2attr[i]]) for i in range(num_verbs)]).cuda()
     coarse_v_counts = torch.bincount(fine2coarse_v_idx, minlength=len(unique_coarse_verbs)).float().clamp_min(1.0)
 
     unique_coarse_objs = sorted(set(train_dataset.obj_hierarchy.values()))
-    if use_frozen_coarse:
-        all_coarse_o_raw = torch.stack([coarse_o_feats_dict[co] for co in unique_coarse_objs]).cuda()
-    else:
-        all_coarse_o_raw = None
     fine2coarse_o_idx = torch.tensor([unique_coarse_objs.index(train_dataset.obj_hierarchy[idx2obj[i]]) for i in range(num_objs)]).cuda()
     coarse_o_counts = torch.bincount(fine2coarse_o_idx, minlength=len(unique_coarse_objs)).float().clamp_min(1.0)
     print("Masks and Tree Built Successfully.")
@@ -136,48 +111,38 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             with torch.cuda.amp.autocast(enabled=True):
                 verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
-                if use_frozen_coarse:
-                    all_coarse_v_eucl = actual_model.c2c_text_v(all_coarse_v_raw)
-                    all_coarse_o_eucl = actual_model.c2c_text_o(all_coarse_o_raw)
-                
             # 2. 强制 FP32 计算双曲法则
             with torch.cuda.amp.autocast(enabled=False):
                 _curv_fp32 = _curv.float()
                 t_alpha_fp32 = actual_model.textual_alpha.exp().float()
                 
                 import models.vlm_models.lorentz as L
-                if use_frozen_coarse:
-                    all_coarse_v_eucl_norm = torch.nan_to_num(all_coarse_v_eucl.float() / (all_coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
-                    all_coarse_o_eucl_norm = torch.nan_to_num(all_coarse_o_eucl.float() / (all_coarse_o_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
+                
+                # ==============================================================
+                # [修改点2]：完全使用切空间平均（Frechet Mean 近似）生成父节点
+                # ==============================================================
+                v_child_scaled_tangent = L.log_map0(verb_text_hyp.float(), _curv_fp32)
+                o_child_scaled_tangent = L.log_map0(obj_text_hyp.float(), _curv_fp32)
 
-                    all_coarse_v_tangent = actual_model.hyp_proj_v_text(all_coarse_v_eucl_norm)
-                    all_coarse_o_tangent = actual_model.hyp_proj_o_text(all_coarse_o_eucl_norm)
+                all_coarse_v_scaled = torch.zeros(
+                    (len(unique_coarse_verbs), v_child_scaled_tangent.shape[-1]),
+                    device=v_child_scaled_tangent.device,
+                    dtype=v_child_scaled_tangent.dtype,
+                )
+                all_coarse_o_scaled = torch.zeros(
+                    (len(unique_coarse_objs), o_child_scaled_tangent.shape[-1]),
+                    device=o_child_scaled_tangent.device,
+                    dtype=o_child_scaled_tangent.dtype,
+                )
 
-                    all_coarse_v_hyp = L.exp_map0(all_coarse_v_tangent * t_alpha_fp32, _curv_fp32)
-                    all_coarse_o_hyp = L.exp_map0(all_coarse_o_tangent * t_alpha_fp32, _curv_fp32)
-                else:
-                    v_child_scaled_tangent = L.log_map0(verb_text_hyp.float(), _curv_fp32)
-                    o_child_scaled_tangent = L.log_map0(obj_text_hyp.float(), _curv_fp32)
+                all_coarse_v_scaled.index_add_(0, fine2coarse_v_idx, v_child_scaled_tangent)
+                all_coarse_o_scaled.index_add_(0, fine2coarse_o_idx, o_child_scaled_tangent)
 
-                    all_coarse_v_scaled = torch.zeros(
-                        (len(unique_coarse_verbs), v_child_scaled_tangent.shape[-1]),
-                        device=v_child_scaled_tangent.device,
-                        dtype=v_child_scaled_tangent.dtype,
-                    )
-                    all_coarse_o_scaled = torch.zeros(
-                        (len(unique_coarse_objs), o_child_scaled_tangent.shape[-1]),
-                        device=o_child_scaled_tangent.device,
-                        dtype=o_child_scaled_tangent.dtype,
-                    )
+                all_coarse_v_scaled = all_coarse_v_scaled / coarse_v_counts.to(all_coarse_v_scaled.device).unsqueeze(1)
+                all_coarse_o_scaled = all_coarse_o_scaled / coarse_o_counts.to(all_coarse_o_scaled.device).unsqueeze(1)
 
-                    all_coarse_v_scaled.index_add_(0, fine2coarse_v_idx, v_child_scaled_tangent)
-                    all_coarse_o_scaled.index_add_(0, fine2coarse_o_idx, o_child_scaled_tangent)
-
-                    all_coarse_v_scaled = all_coarse_v_scaled / coarse_v_counts.to(all_coarse_v_scaled.device).unsqueeze(1)
-                    all_coarse_o_scaled = all_coarse_o_scaled / coarse_o_counts.to(all_coarse_o_scaled.device).unsqueeze(1)
-
-                    all_coarse_v_hyp = L.exp_map0(all_coarse_v_scaled, _curv_fp32)
-                    all_coarse_o_hyp = L.exp_map0(all_coarse_o_scaled, _curv_fp32)
+                all_coarse_v_hyp = L.exp_map0(all_coarse_v_scaled, _curv_fp32)
+                all_coarse_o_hyp = L.exp_map0(all_coarse_o_scaled, _curv_fp32)
                 
                 # ====== 动态读取配置参数 ======
                 w_att_obj = getattr(config, 'att_obj_w', 0.2)
@@ -189,29 +154,20 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 entail_loss_fn = EntailmentConeLoss(margin=entail_margin)
                 align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
                 
-                # ==============================================================
-                # 主线：真正的纯双曲 Component 基线 
-                # (拒绝人工干预，让网络通过 scale_v/o 寻找平衡，根除量纲吞噬)
-                # ==============================================================
                 scale_v = actual_model.logit_scale_v.exp()
                 scale_o = actual_model.logit_scale_o.exp()
                 
                 verb_logits_scaled = verb_logits_hyp * scale_v
                 obj_logits_scaled = obj_logits_hyp * scale_o
                 
-                # 现在距离尺度已在反向传播中自动对齐，安全合并
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 pred_com_train = verb_logits_scaled[:, train_v_inds] + obj_logits_scaled[:, train_o_inds]
                 
-                # 分类计算不再需要人工的 *100.0 或 *10.0，scale 自带缩放！
                 loss_com = Loss_fn(pred_com_train, batch_target)
                 loss_verb_hyp = Loss_fn(verb_logits_scaled, batch_verb)
                 loss_obj_hyp = Loss_fn(obj_logits_scaled, batch_obj)
                 
-                # ==============================================================
-                # 支线 1：【语义级判别对齐】
-                # (Triplet 必须使用未被 scale 过的绝对距离 verb_logits_hyp)
-                # ==============================================================
+                # 【语义级判别对齐】
                 batch_v_mask = verb_hard_mask_matrix[batch_verb]
                 batch_o_mask = obj_hard_mask_matrix[batch_obj]
                 
@@ -219,9 +175,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 loss_align_o = align_loss_fn(obj_logits_hyp, batch_obj, hard_mask=batch_o_mask)
                 loss_alignment = loss_align_v + loss_align_o
                 
-                # ==============================================================
-                # 支线 2：【全局文本树蕴含】
-                # ==============================================================
+                # 【全局文本树蕴含】
                 loss_ent_v = entail_loss_fn(verb_text_hyp.float(), all_coarse_v_hyp[fine2coarse_v_idx], _curv_fp32)
                 loss_ent_o = entail_loss_fn(obj_text_hyp.float(), all_coarse_o_hyp[fine2coarse_o_idx], _curv_fp32)
                 
@@ -232,9 +186,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
                 loss_entailment = loss_ent_v + loss_ent_o + loss_ent_vid_v + loss_ent_vid_o
                 
-                # ==============================================================
                 # 【终极流形总损失】
-                # ==============================================================
                 loss = loss_com + w_att_obj * (loss_verb_hyp + loss_obj_hyp) + w_entail * loss_entailment + w_align * loss_alignment
                 
                 loss = torch.nan_to_num(loss) / config.gradient_accumulation_steps

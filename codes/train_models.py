@@ -30,9 +30,6 @@ def save_checkpoint(state, save_path, epoch, best=False):
 def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset, scaler):
     train_dataloader = DataLoader(train_dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
 
-    # coarse 父节点的来源：
-    # - "mean_children"(默认)：用当前批次下模型产生的 fine 文本嵌入，按层级把同父节点的 children 做 log-map 平均，得到父节点
-    # - "frozen_clip"：使用冻结 CLIP 直接编码 coarse 文本
     coarse_parent_source = str(getattr(config, "coarse_parent_source", "mean_children")).lower()
     use_frozen_coarse = coarse_parent_source in {"frozen_clip", "frozen", "clip"}
 
@@ -47,7 +44,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         with torch.no_grad():
             for cv in set(train_dataset.verb_hierarchy.values()):
                 tokens = clip.tokenize(f"an action of {cv}").to(device)
-                # encode_text 输出通常是 (1, D)，这里 squeeze 掉多余维度，避免后续 stack 出现 (N,1,D) 导致隐式 broadcast
                 coarse_v_feats_dict[cv] = frozen_clip.encode_text(tokens).float().squeeze(0)
             for co in set(train_dataset.obj_hierarchy.values()):
                 tokens = clip.tokenize(f"a photo of a {co}").to(device)
@@ -67,14 +63,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     attr2idx, obj2idx = train_dataset.attr2idx, train_dataset.obj2idx
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj]) for attr, obj in train_dataset.train_pairs]).cuda()
 
-    # ==============================================================
-    # [新增结构 1]: 构造基于粗粒度层次的 Semantic Hard Negative Mask (语义级难负样本)
-    # ==============================================================
     print("Building Semantic Hard Negative Masks and Global Tree Indices...")
     idx2attr = {v: k for k, v in attr2idx.items()}
     num_verbs = len(idx2attr)
 
-    # 仅将训练集中出现过的 primitive 作为负样本候选，避免把 unseen primitive 也强行推开（会显著伤害零样本）
     train_verbs = set([a for (a, _) in train_dataset.train_pairs])
     train_objs = set([o for (_, o) in train_dataset.train_pairs])
     is_train_verb = torch.tensor([idx2attr[i] in train_verbs for i in range(num_verbs)], dtype=torch.bool)
@@ -87,7 +79,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         for j in range(num_verbs):
             if i != j and is_train_verb[j] and train_dataset.verb_hierarchy[idx2attr[j]] == coarse_i:
                 verb_hard_mask_matrix[i, j] = True
-        # 安全回退: 如果这个动作是孤立的(同簇无其他类别)，回退到全局负样本
         if not verb_hard_mask_matrix[i].any():
             verb_hard_mask_matrix[i] = is_train_verb
             verb_hard_mask_matrix[i, i] = False
@@ -107,16 +98,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             obj_hard_mask_matrix[i] = is_train_obj
             obj_hard_mask_matrix[i, i] = False
 
-    # ==============================================================
-    # [新增结构 2]: 建立全局全词表的树状拓扑关系 (Global Vocabulary Tree)
-    # 放弃 Batch-wise 抖动，直接对整棵文本树进行对齐！
-    # ==============================================================
     unique_coarse_verbs = sorted(set(train_dataset.verb_hierarchy.values()))
     if use_frozen_coarse:
         all_coarse_v_raw = torch.stack([coarse_v_feats_dict[cv] for cv in unique_coarse_verbs]).cuda()
     else:
         all_coarse_v_raw = None
-    # 建立从 细粒度ID 到 粗粒度唯一ID 的索引映射
     fine2coarse_v_idx = torch.tensor([unique_coarse_verbs.index(train_dataset.verb_hierarchy[idx2attr[i]]) for i in range(num_verbs)]).cuda()
     coarse_v_counts = torch.bincount(fine2coarse_v_idx, minlength=len(unique_coarse_verbs)).float().clamp_min(1.0)
 
@@ -128,9 +114,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     fine2coarse_o_idx = torch.tensor([unique_coarse_objs.index(train_dataset.obj_hierarchy[idx2obj[i]]) for i in range(num_objs)]).cuda()
     coarse_o_counts = torch.bincount(fine2coarse_o_idx, minlength=len(unique_coarse_objs)).float().clamp_min(1.0)
     print("Masks and Tree Built Successfully.")
-    # ==============================================================
 
-    # hard negative mask 与后续 batch_* 索引需要在同一设备上
     mask_device = train_pairs.device
     verb_hard_mask_matrix = verb_hard_mask_matrix.to(mask_device)
     obj_hard_mask_matrix = obj_hard_mask_matrix.to(mask_device)
@@ -147,14 +131,12 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         for bid, batch in enumerate(train_dataloader):
             batch_img = batch[0].cuda()
             batch_verb, batch_obj, batch_target = batch[1].cuda(), batch[2].cuda(), batch[3].cuda()
-            # 彻底抛弃 batch_coarse_verb, batch_coarse_obj，因为我们现在有了全图视角！
 
             # 1. AMP 半精度跑 Backbone
             with torch.cuda.amp.autocast(enabled=True):
                 verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
                 if use_frozen_coarse:
-                    # 直接提取全表(所有的)粗粒度特征
                     all_coarse_v_eucl = actual_model.c2c_text_v(all_coarse_v_raw)
                     all_coarse_o_eucl = actual_model.c2c_text_o(all_coarse_o_raw)
                 
@@ -165,18 +147,15 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
                 import models.vlm_models.lorentz as L
                 if use_frozen_coarse:
-                    # 安全归一化全局特征
                     all_coarse_v_eucl_norm = torch.nan_to_num(all_coarse_v_eucl.float() / (all_coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
                     all_coarse_o_eucl_norm = torch.nan_to_num(all_coarse_o_eucl.float() / (all_coarse_o_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
 
                     all_coarse_v_tangent = actual_model.hyp_proj_v_text(all_coarse_v_eucl_norm)
                     all_coarse_o_tangent = actual_model.hyp_proj_o_text(all_coarse_o_eucl_norm)
 
-                    # 得到全局唯一的粗粒度双曲节点
                     all_coarse_v_hyp = L.exp_map0(all_coarse_v_tangent * t_alpha_fp32, _curv_fp32)
                     all_coarse_o_hyp = L.exp_map0(all_coarse_o_tangent * t_alpha_fp32, _curv_fp32)
                 else:
-                    # 用 fine 文本双曲点 log_map0 到切空间做均值，得到 coarse 父节点（同一编码分布，更稳）
                     v_child_scaled_tangent = L.log_map0(verb_text_hyp.float(), _curv_fp32)
                     o_child_scaled_tangent = L.log_map0(obj_text_hyp.float(), _curv_fp32)
 
@@ -206,36 +185,46 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 w_align = getattr(config, 'lambda_align', getattr(config, 'w_align', 1.0))
                 align_margin = getattr(config, 'align_margin', 0.2)
                 entail_margin = getattr(config, 'entail_margin', 0.01)
-                hyp_temp = getattr(config, 'hyp_temp', 20.0)
 
                 entail_loss_fn = EntailmentConeLoss(margin=entail_margin)
                 align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
                 
                 # ==============================================================
-                # 主线：纯双曲分数的组合推断
-                train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
-                pred_com_train = verb_logits_hyp[:, train_v_inds] + obj_logits_hyp[:, train_o_inds]
+                # 主线：真正的纯双曲 Component 基线 
+                # (拒绝人工干预，让网络通过 scale_v/o 寻找平衡，根除量纲吞噬)
+                # ==============================================================
+                scale_v = actual_model.logit_scale_v.exp()
+                scale_o = actual_model.logit_scale_o.exp()
                 
-                loss_com = Loss_fn(pred_com_train * hyp_temp, batch_target)
-                loss_verb_hyp = Loss_fn(verb_logits_hyp * hyp_temp, batch_verb)
-                loss_obj_hyp = Loss_fn(obj_logits_hyp * hyp_temp, batch_obj)
+                verb_logits_scaled = verb_logits_hyp * scale_v
+                obj_logits_scaled = obj_logits_hyp * scale_o
+                
+                # 现在距离尺度已在反向传播中自动对齐，安全合并
+                train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
+                pred_com_train = verb_logits_scaled[:, train_v_inds] + obj_logits_scaled[:, train_o_inds]
+                
+                # 分类计算不再需要人工的 *100.0 或 *10.0，scale 自带缩放！
+                loss_com = Loss_fn(pred_com_train, batch_target)
+                loss_verb_hyp = Loss_fn(verb_logits_scaled, batch_verb)
+                loss_obj_hyp = Loss_fn(obj_logits_scaled, batch_obj)
                 
                 # ==============================================================
-                # 支线 1：【语义级判别对齐】传入 Mask 限定负样本必须来自同一个粗类！
-                batch_v_mask = verb_hard_mask_matrix[batch_verb].cuda()
-                batch_o_mask = obj_hard_mask_matrix[batch_obj].cuda()
+                # 支线 1：【语义级判别对齐】
+                # (Triplet 必须使用未被 scale 过的绝对距离 verb_logits_hyp)
+                # ==============================================================
+                batch_v_mask = verb_hard_mask_matrix[batch_verb]
+                batch_o_mask = obj_hard_mask_matrix[batch_obj]
                 
                 loss_align_v = align_loss_fn(verb_logits_hyp, batch_verb, hard_mask=batch_v_mask)
                 loss_align_o = align_loss_fn(obj_logits_hyp, batch_obj, hard_mask=batch_o_mask)
                 loss_alignment = loss_align_v + loss_align_o
                 
                 # ==============================================================
-                # 支线 2：【全局文本树蕴含】强制对齐整棵 Vocabulary Tree！
-                # 不再依赖 batch 内到底有哪些词，而是把所有词表词全部定在流形上！
+                # 支线 2：【全局文本树蕴含】
+                # ==============================================================
                 loss_ent_v = entail_loss_fn(verb_text_hyp.float(), all_coarse_v_hyp[fine2coarse_v_idx], _curv_fp32)
                 loss_ent_o = entail_loss_fn(obj_text_hyp.float(), all_coarse_o_hyp[fine2coarse_o_idx], _curv_fp32)
                 
-                # 视觉到文本的蕴含，依然保持 Batch-wise (视觉实体是流动的)
                 batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
                 batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
                 loss_ent_vid_v = entail_loss_fn(v_feat_hyp.float(), batch_fine_v_hyp, _curv_fp32)
@@ -245,6 +234,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
                 # ==============================================================
                 # 【终极流形总损失】
+                # ==============================================================
                 loss = loss_com + w_att_obj * (loss_verb_hyp + loss_obj_hyp) + w_entail * loss_entailment + w_align * loss_alignment
                 
                 loss = torch.nan_to_num(loss) / config.gradient_accumulation_steps

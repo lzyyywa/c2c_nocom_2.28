@@ -30,10 +30,6 @@ def save_checkpoint(state, save_path, epoch, best=False):
 def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset, scaler):
     train_dataloader = DataLoader(train_dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
 
-    # ==============================================================
-    # [修改点1]：强制关闭 frozen_clip，强制走子节点切空间均值逻辑！
-    # 只有这样，父节点才会因为求均值而缩短范数，自动靠近原点，形成完美层级。
-    # ==============================================================
     use_frozen_coarse = False
     print("Forcing coarse parents to be computed from mean of fine children (log-map mean) to preserve hyperbolic hierarchy.")
 
@@ -107,20 +103,13 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_img = batch[0].cuda()
             batch_verb, batch_obj, batch_target = batch[1].cuda(), batch[2].cuda(), batch[3].cuda()
 
-            # 1. AMP 半精度跑 Backbone
             with torch.cuda.amp.autocast(enabled=True):
                 verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
-            # 2. 强制 FP32 计算双曲法则
             with torch.cuda.amp.autocast(enabled=False):
                 _curv_fp32 = _curv.float()
-                t_alpha_fp32 = actual_model.textual_alpha.exp().float()
-                
                 import models.vlm_models.lorentz as L
                 
-                # ==============================================================
-                # [修改点2]：完全使用切空间平均（Frechet Mean 近似）生成父节点
-                # ==============================================================
                 v_child_scaled_tangent = L.log_map0(verb_text_hyp.float(), _curv_fp32)
                 o_child_scaled_tangent = L.log_map0(obj_text_hyp.float(), _curv_fp32)
 
@@ -144,7 +133,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 all_coarse_v_hyp = L.exp_map0(all_coarse_v_scaled, _curv_fp32)
                 all_coarse_o_hyp = L.exp_map0(all_coarse_o_scaled, _curv_fp32)
                 
-                # ====== 动态读取配置参数 ======
                 w_att_obj = getattr(config, 'att_obj_w', 0.2)
                 w_entail = getattr(config, 'lambda_entail', getattr(config, 'w_entail', 0.1))
                 w_align = getattr(config, 'lambda_align', getattr(config, 'w_align', 1.0))
@@ -153,6 +141,14 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                 entail_loss_fn = EntailmentConeLoss(margin=entail_margin)
                 align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
+                
+                # ==============================================================
+                # 【终极修正：强化温度截断】
+                # 防止在训练期间，双曲空间的负距离导致的 logit 被指数级放大，
+                # 将最大值牢牢锁在 4.6052 以内 (即 scale 最大为 100)
+                # ==============================================================
+                actual_model.logit_scale_v.data = torch.clamp(actual_model.logit_scale_v.data, max=4.6052)
+                actual_model.logit_scale_o.data = torch.clamp(actual_model.logit_scale_o.data, max=4.6052)
                 
                 scale_v = actual_model.logit_scale_v.exp()
                 scale_o = actual_model.logit_scale_o.exp()
@@ -167,7 +163,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 loss_verb_hyp = Loss_fn(verb_logits_scaled, batch_verb)
                 loss_obj_hyp = Loss_fn(obj_logits_scaled, batch_obj)
                 
-                # 【语义级判别对齐】
                 batch_v_mask = verb_hard_mask_matrix[batch_verb]
                 batch_o_mask = obj_hard_mask_matrix[batch_obj]
                 
@@ -175,7 +170,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 loss_align_o = align_loss_fn(obj_logits_hyp, batch_obj, hard_mask=batch_o_mask)
                 loss_alignment = loss_align_v + loss_align_o
                 
-                # 【全局文本树蕴含】
                 loss_ent_v = entail_loss_fn(verb_text_hyp.float(), all_coarse_v_hyp[fine2coarse_v_idx], _curv_fp32)
                 loss_ent_o = entail_loss_fn(obj_text_hyp.float(), all_coarse_o_hyp[fine2coarse_o_idx], _curv_fp32)
                 
@@ -186,7 +180,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
                 loss_entailment = loss_ent_v + loss_ent_o + loss_ent_vid_v + loss_ent_vid_o
                 
-                # 【终极流形总损失】
                 loss = loss_com + w_att_obj * (loss_verb_hyp + loss_obj_hyp) + w_entail * loss_entailment + w_align * loss_alignment
                 
                 loss = torch.nan_to_num(loss) / config.gradient_accumulation_steps

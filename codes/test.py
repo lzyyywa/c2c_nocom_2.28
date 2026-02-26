@@ -14,7 +14,7 @@ from tqdm import tqdm
 import cv2
 
 from utils import *
-from loss import loss_calu
+
 from torch.nn.modules.loss import CrossEntropyLoss
 # from parameters import parser, YML_PATH
 # from dataset import CompositionDataset

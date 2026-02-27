@@ -115,9 +115,7 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
 
-        # ==============================================================
-        # 【对齐 HyCoCLIP】：释放曲率，让模型根据孔径缩水策略自动寻找最优曲率
-        # ==============================================================
+        # 释放曲率学习，严格限制范围在 [0.1, 10.0]
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
         self._curv_minmax = {"max": math.log(10.0), "min": math.log(0.1)}
 
@@ -175,13 +173,13 @@ class CustomCLIP(nn.Module):
         obj_text_raw = torch.nan_to_num(obj_text_features)
 
         # ==============================================================
-        # 【特征初始化：保角缩放 (Direction-Preserving Scaling)】
+        # 【HyCoCLIP 对齐修复】：严禁 F.normalize! 允许特征保留原始范数
+        # 只做 Clamp 保证数值稳定不溢出
         # ==============================================================
-        d = v_feat_raw.size(-1)
-        v_feat_stable = F.normalize(v_feat_raw, dim=-1) * math.sqrt(d)
-        o_feat_stable = F.normalize(o_feat_raw, dim=-1) * math.sqrt(d)
-        verb_text_stable = F.normalize(verb_text_raw, dim=-1) * math.sqrt(d)
-        obj_text_stable = F.normalize(obj_text_raw, dim=-1) * math.sqrt(d)
+        v_feat_stable = torch.clamp(v_feat_raw, min=-50.0, max=50.0)
+        o_feat_stable = torch.clamp(o_feat_raw, min=-50.0, max=50.0)
+        verb_text_stable = torch.clamp(verb_text_raw, min=-50.0, max=50.0)
+        obj_text_stable = torch.clamp(obj_text_raw, min=-50.0, max=50.0)
 
         # 参数安全截断
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
@@ -212,12 +210,7 @@ class CustomCLIP(nn.Module):
         if self.training:
             return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
-            # ==============================================================
-            # 【测试阶段：只通过原始负距离来 Ranking】
-            # ==============================================================
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-
-            # 直接使用原生的双曲负距离相加作为组合相似度进行验证与测试
             com_logits = verb_logits_hyp[:, verb_idx] + obj_logits_hyp[:, obj_idx]
             return com_logits
 
@@ -254,8 +247,8 @@ def build_model(train_dataset,cfg):
             param.requires_grad = True
         
         # ==============================================================
-        # 【对齐 HyCoCLIP】：将曲率加回优化器更新列表
+        # 【HyCoCLIP 对齐修复】：去除 hyp_proj 的更新权限，防止模型靠权重变0来作弊
         # ==============================================================
-        elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name or 'logit_scale' in name:
+        elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'logit_scale' in name:
             param.requires_grad = True
     return model

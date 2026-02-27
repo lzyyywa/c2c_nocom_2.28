@@ -12,35 +12,31 @@ import models.vlm_models.lorentz as L
 
 class EntailmentConeLoss(nn.Module):
     """
-    【双曲层级蕴含损失】(Hierarchical Entailment Cone Loss)
-    强迫细粒度子概念进入粗粒度父概念的蕴含锥 (Cone) 内。
-    包含：1. 角度惩罚 (Cone Penalty)  2. 范数惩罚 (Norm Penalty)
-    [已修复]: 引入 safe_norm，防止特征趋近原点时梯度为 NaN
+    【完全对齐 HyCoCLIP】双曲层级蕴含损失 (Aperture-Thresholded Entailment)
+    放弃人为构造的 norm_penalty，采用官方的“孔径缩水”策略强迫特征远离原点。
+    
+    原理：在双曲空间中，越靠近原点，能覆盖的孔径（aperture）越大（接近180度）。
+    如果我们人为将孔径缩小（例如乘以 0.7），而在原点附近的特征因为重叠导致夹角变大，
+    就会直接越过这个变窄的孔径产生巨大的 Loss。
+    为了降低 Loss，模型唯一的出路就是将父子节点整体向双曲空间的边缘推。
     """
-    def __init__(self, margin=0.01):
+    def __init__(self, aperture_thresh=0.7):
         super().__init__()
-        self.margin = margin
-
-    # 本地化防崩塌算子
-    def safe_norm(self, x, dim=-1):
-        # 强制加入 eps=1e-7，斩断 sqrt(0) 求导时分母为 0 的可能性
-        return torch.sqrt(torch.clamp(torch.sum(x**2, dim=dim), min=1e-7))
+        # HyCoCLIP 官方跨模态/层级推荐阈值 (例如 0.7 或 1.2)
+        self.aperture_thresh = aperture_thresh
 
     def forward(self, child_emb, parent_emb, curv):
-        # 1. 计算父节点的半顶角与实际夹角
+        # 1. 计算父节点到子节点的实际夹角
         angle = L.oxy_angle(parent_emb, child_emb, curv)
+        
+        # 2. 计算父节点的理论半顶角 (孔径)
         aperture = L.half_aperture(parent_emb, curv)
         
-        # 若夹角大于半顶角(越界)，则产生 violation 惩罚
-        violation = torch.clamp(angle - aperture + self.margin, min=0.0)
+        # 3. HyCoCLIP 核心防坍缩逻辑：孔径缩水
+        # 要求实际夹角必须小于缩水后的孔径。
+        violation = torch.clamp(angle - self.aperture_thresh * aperture, min=0.0)
         
-        # 2. 范数惩罚: 强迫子节点(更具体)距离原点更远
-        # [严防死守] 替换原有的 torch.norm 为 safe_norm
-        norm_child = self.safe_norm(child_emb, dim=-1)
-        norm_parent = self.safe_norm(parent_emb, dim=-1)
-        norm_penalty = torch.clamp(norm_parent - norm_child, min=0.0)
-        
-        return (violation + 0.1 * norm_penalty).mean()
+        return violation.mean()
 
 
 class HyperbolicHardNegativeAlignmentLoss(nn.Module):

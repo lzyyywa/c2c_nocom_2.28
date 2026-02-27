@@ -97,7 +97,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_train_losses, epoch_com_losses = [], []
         epoch_oo_losses, epoch_vv_losses = [], []
         epoch_ent_losses, epoch_ali_losses = [], []
-        epoch_curv = []  # 恢复曲率记录列表
+        epoch_curv = []
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f"Current_lr:{temp_lr}")
@@ -143,18 +143,15 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 align_margin = getattr(config, 'align_margin', 0.2)
                 
                 # ==============================================================
-                # 【修改点】：引入 HyCoCLIP 的孔径收缩阈值，弃用原来的 margin
+                # 【HyCoCLIP 对齐修复】：区分 Local (1.2) 和 Global (0.7) 阈值
                 # ==============================================================
-                entail_thresh = getattr(config, 'entail_thresh', 0.7)
+                entail_loss_global = EntailmentConeLoss(aperture_thresh=0.7)  # 跨模态 Text->Video
+                entail_loss_local = EntailmentConeLoss(aperture_thresh=1.2)   # 同模态 Coarse->Fine
                 
-                # [方案1：动词约束松绑系数] 默认 0.2
+                align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
                 verb_relax_ratio = getattr(config, 'verb_relax_ratio', 0.2)
 
-                # 将 entail_loss_fn 的初始化参数改为 aperture_thresh
-                entail_loss_fn = EntailmentConeLoss(aperture_thresh=entail_thresh)
-                align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
-                
-                # 训练期需要温度放大来产生梯度
+                # 温度放大
                 actual_model.logit_scale_v.data = torch.clamp(actual_model.logit_scale_v.data, max=4.6052)
                 actual_model.logit_scale_o.data = torch.clamp(actual_model.logit_scale_o.data, max=4.6052)
                 scale_v = actual_model.logit_scale_v.exp()
@@ -177,18 +174,22 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 loss_align_o = align_loss_fn(obj_logits_hyp, batch_obj, hard_mask=batch_o_mask)
                 loss_alignment = (verb_relax_ratio * loss_align_v) + loss_align_o
                 
-                loss_ent_v = entail_loss_fn(verb_text_hyp.float(), all_coarse_v_hyp[fine2coarse_v_idx], _curv_fp32)
-                loss_ent_o = entail_loss_fn(obj_text_hyp.float(), all_coarse_o_hyp[fine2coarse_o_idx], _curv_fp32)
+                # 同模态约束 (Local: 1.2)
+                loss_ent_v = entail_loss_local(verb_text_hyp.float(), all_coarse_v_hyp[fine2coarse_v_idx], _curv_fp32)
+                loss_ent_o = entail_loss_local(obj_text_hyp.float(), all_coarse_o_hyp[fine2coarse_o_idx], _curv_fp32)
                 
+                # 跨模态约束 (Global: 0.7)
                 batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
                 batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
-                loss_ent_vid_v = entail_loss_fn(v_feat_hyp.float(), batch_fine_v_hyp, _curv_fp32)
-                loss_ent_vid_o = entail_loss_fn(o_feat_hyp.float(), batch_fine_o_hyp, _curv_fp32)
+                loss_ent_vid_v = entail_loss_global(v_feat_hyp.float(), batch_fine_v_hyp, _curv_fp32)
+                loss_ent_vid_o = entail_loss_global(o_feat_hyp.float(), batch_fine_o_hyp, _curv_fp32)
                 
-                loss_entailment = (verb_relax_ratio * loss_ent_v) + loss_ent_o + (verb_relax_ratio * loss_ent_vid_v) + loss_ent_vid_o
+                # ==============================================================
+                # 【HyCoCLIP 对齐修复】：压低 Entailment Loss 的总梯度占比 (乘以 0.25)
+                # ==============================================================
+                loss_entailment = 0.25 * ((verb_relax_ratio * loss_ent_v) + loss_ent_o + (verb_relax_ratio * loss_ent_vid_v) + loss_ent_vid_o)
                 
                 loss = loss_com + w_att_obj * (loss_verb_hyp + loss_obj_hyp) + w_entail * loss_entailment + w_align * loss_alignment
-                
                 loss = torch.nan_to_num(loss) / config.gradient_accumulation_steps
 
             scaler.scale(loss).backward()
@@ -205,7 +206,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_oo_losses.append(loss_obj_hyp.item())
             epoch_ent_losses.append(loss_entailment.item())
             epoch_ali_losses.append(loss_alignment.item())
-            epoch_curv.append(_curv.item())  # 记录当前批次的曲率
+            epoch_curv.append(_curv.item())
 
             progress_bar.set_postfix({"train loss": np.mean(epoch_train_losses[-50:])})
             progress_bar.update()
@@ -213,9 +214,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         lr_scheduler.step()
         progress_bar.close()
         
-        # ==============================================================
-        # 【恢复打印功能】：在控制台清晰展示核心指标的变化
-        # ==============================================================
         print(f"epoch {i + 1} | train loss: {np.mean(epoch_train_losses):.4f} | ent loss: {np.mean(epoch_ent_losses):.4f} | ali loss: {np.mean(epoch_ali_losses):.4f} | curv c: {np.mean(epoch_curv):.4f}")
         
         train_losses.append(np.mean(epoch_train_losses))
@@ -224,7 +222,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses)}\n")
         log_training.write(f"epoch {i + 1} vv loss {np.mean(epoch_vv_losses)}\n")
         log_training.write(f"epoch {i + 1} oo loss {np.mean(epoch_oo_losses)}\n")
-        
         log_training.write(f"epoch {i + 1} ent loss {np.mean(epoch_ent_losses)}\n")
         log_training.write(f"epoch {i + 1} ali loss {np.mean(epoch_ali_losses)}\n")
         log_training.write(f"epoch {i + 1} curv c {np.mean(epoch_curv)}\n")
@@ -239,9 +236,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
         
-        # ==============================================================
-        # 【100% 还原的 Baseline 评测与日志逻辑】
-        # ==============================================================
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
             print("Evaluating val dataset:")
             loss_avg, val_result = evaluate(model, val_dataset, config)
@@ -262,9 +256,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     best_loss = loss_avg.cpu().float()
                     print("Evaluating test dataset:")
                     loss_avg, val_result = evaluate(model, test_dataset, config)
-                    torch.save(model.state_dict(), os.path.join(
-                        config.save_path, f"best.pt"
-                    ))
+                    torch.save(model.state_dict(), os.path.join(config.save_path, f"best.pt"))
                     result = ""
                     for key in val_result:
                         if key in key_set:
@@ -281,9 +273,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     print('find best!')
                     log_training.write('find best!')
                     loss_avg, val_result = evaluate(model, test_dataset, config)
-                    torch.save(model.state_dict(), os.path.join(
-                        config.save_path, f"best.pt"
-                    ))
+                    torch.save(model.state_dict(), os.path.join(config.save_path, f"best.pt"))
                     result = ""
                     for key in val_result:
                         if key in key_set:
@@ -300,9 +290,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
         if i + 1 == config.epochs:
             print("Evaluating test dataset on Closed World")
-            model.load_state_dict(torch.load(os.path.join(
-                config.save_path, "best.pt"
-            )))
+            model.load_state_dict(torch.load(os.path.join(config.save_path, "best.pt")))
             loss_avg, val_result = evaluate(model, test_dataset, config)
             result = ""
             for key in val_result:

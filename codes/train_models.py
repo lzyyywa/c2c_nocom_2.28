@@ -97,6 +97,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_train_losses, epoch_com_losses = [], []
         epoch_oo_losses, epoch_vv_losses = [], []
         epoch_ent_losses, epoch_ali_losses = [], []
+        epoch_curv = []  # 恢复曲率记录列表
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f"Current_lr:{temp_lr}")
@@ -140,12 +141,17 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 w_entail = getattr(config, 'lambda_entail', getattr(config, 'w_entail', 0.1))
                 w_align = getattr(config, 'lambda_align', getattr(config, 'w_align', 1.0))
                 align_margin = getattr(config, 'align_margin', 0.2)
-                entail_margin = getattr(config, 'entail_margin', 0.01)
+                
+                # ==============================================================
+                # 【修改点】：引入 HyCoCLIP 的孔径收缩阈值，弃用原来的 margin
+                # ==============================================================
+                entail_thresh = getattr(config, 'entail_thresh', 0.7)
                 
                 # [方案1：动词约束松绑系数] 默认 0.2
                 verb_relax_ratio = getattr(config, 'verb_relax_ratio', 0.2)
 
-                entail_loss_fn = EntailmentConeLoss(margin=entail_margin)
+                # 将 entail_loss_fn 的初始化参数改为 aperture_thresh
+                entail_loss_fn = EntailmentConeLoss(aperture_thresh=entail_thresh)
                 align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
                 
                 # 训练期需要温度放大来产生梯度
@@ -199,19 +205,29 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_oo_losses.append(loss_obj_hyp.item())
             epoch_ent_losses.append(loss_entailment.item())
             epoch_ali_losses.append(loss_alignment.item())
+            epoch_curv.append(_curv.item())  # 记录当前批次的曲率
 
             progress_bar.set_postfix({"train loss": np.mean(epoch_train_losses[-50:])})
             progress_bar.update()
 
         lr_scheduler.step()
         progress_bar.close()
-        progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}")
+        
+        # ==============================================================
+        # 【恢复打印功能】：在控制台清晰展示核心指标的变化
+        # ==============================================================
+        print(f"epoch {i + 1} | train loss: {np.mean(epoch_train_losses):.4f} | ent loss: {np.mean(epoch_ent_losses):.4f} | ali loss: {np.mean(epoch_ali_losses):.4f} | curv c: {np.mean(epoch_curv):.4f}")
+        
         train_losses.append(np.mean(epoch_train_losses))
         log_training.write('\n')
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}\n")
         log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses)}\n")
         log_training.write(f"epoch {i + 1} vv loss {np.mean(epoch_vv_losses)}\n")
         log_training.write(f"epoch {i + 1} oo loss {np.mean(epoch_oo_losses)}\n")
+        
+        log_training.write(f"epoch {i + 1} ent loss {np.mean(epoch_ent_losses)}\n")
+        log_training.write(f"epoch {i + 1} ali loss {np.mean(epoch_ali_losses)}\n")
+        log_training.write(f"epoch {i + 1} curv c {np.mean(epoch_curv)}\n")
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({

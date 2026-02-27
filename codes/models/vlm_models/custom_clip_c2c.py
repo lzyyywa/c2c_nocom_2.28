@@ -6,7 +6,7 @@ from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 from models.vlm_models.text_learner import get_text_learner
-from models.vlm_models import lorentz as L  
+from models.vlm_models import lorentz as L
 
 import torch.nn.functional as F
 from einops import rearrange
@@ -80,10 +80,10 @@ class TextEncoder(nn.Module):
             block.attn_mask = block.attn_mask[:cfg.ctx_length, :cfg.ctx_length]
         self.dtype = clip_model.dtype
 
-    def forward(self, x, tokenized_prompts):  
-        x = x.permute(1, 0, 2)  
+    def forward(self, x, tokenized_prompts):
+        x = x.permute(1, 0, 2)
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  
+        x = x.permute(1, 0, 2)
         x = self.ln_final(x)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
@@ -117,11 +117,11 @@ class CustomCLIP(nn.Module):
 
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
         self._curv_minmax = {"max": math.log(10.0), "min": math.log(0.1)}
-        
+
         # 严格对齐 MERU/HyCoCLIP: alpha 初始化为 1/sqrt(d)
         self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
         self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
-        
+
         self.logit_scale_v = nn.Parameter(torch.tensor(1 / 0.07).log())
         self.logit_scale_o = nn.Parameter(torch.tensor(1 / 0.07).log())
 
@@ -141,7 +141,7 @@ class CustomCLIP(nn.Module):
         self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_o_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
-        
+
         nn.init.eye_(self.hyp_proj_v_vis.weight)
         nn.init.zeros_(self.hyp_proj_v_vis.bias)
         nn.init.eye_(self.hyp_proj_o_vis.weight)
@@ -210,7 +210,7 @@ class CustomCLIP(nn.Module):
         else:
             verb_scaled = verb_logits_hyp * self.logit_scale_v.exp()
             obj_scaled = obj_logits_hyp * self.logit_scale_o.exp()
-            
+
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = verb_scaled[:, verb_idx] + obj_scaled[:, obj_idx]
             return com_logits

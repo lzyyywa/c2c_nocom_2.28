@@ -115,6 +115,9 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
 
+        # ==============================================================
+        # 【对齐 HyCoCLIP】：释放曲率，让模型根据孔径缩水策略自动寻找最优曲率
+        # ==============================================================
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
         self._curv_minmax = {"max": math.log(10.0), "min": math.log(0.1)}
 
@@ -172,7 +175,7 @@ class CustomCLIP(nn.Module):
         obj_text_raw = torch.nan_to_num(obj_text_features)
 
         # ==============================================================
-        # 【特征初始化修复：保角缩放 (Direction-Preserving Scaling)】
+        # 【特征初始化：保角缩放 (Direction-Preserving Scaling)】
         # ==============================================================
         d = v_feat_raw.size(-1)
         v_feat_stable = F.normalize(v_feat_raw, dim=-1) * math.sqrt(d)
@@ -210,9 +213,7 @@ class CustomCLIP(nn.Module):
             return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
             # ==============================================================
-            # 【测试修复核心：移除温度缩放】
-            # 测试阶段 (Evaluation) 我们只需要通过原始负距离来 Ranking！
-            # 强行乘以 logit_scale 会导致 test.py 中的 bias AUC 阈值失效。
+            # 【测试阶段：只通过原始负距离来 Ranking】
             # ==============================================================
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
 
@@ -236,7 +237,7 @@ def build_model(train_dataset,cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Direction-Preserved & Eval-Fixed Hyperbolic)")
+    print("Building custom CLIP (HyCoCLIP-aligned Hyperbolic)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     print("Turning off gradients in both the image and the text encoder")
     for name, param in model.named_parameters():
@@ -251,6 +252,10 @@ def build_model(train_dataset,cfg):
                     param.requires_grad_(True)
         elif 'video_encoder' in name and ('temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name):
             param.requires_grad = True
+        
+        # ==============================================================
+        # 【对齐 HyCoCLIP】：将曲率加回优化器更新列表
+        # ==============================================================
         elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name or 'logit_scale' in name:
             param.requires_grad = True
     return model

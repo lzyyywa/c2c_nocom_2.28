@@ -118,6 +118,7 @@ class CustomCLIP(nn.Module):
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
         self._curv_minmax = {"max": math.log(10.0), "min": math.log(0.1)}
 
+        # 官方极简安全初始化：alpha 初始设为 1/sqrt(d)
         self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
         self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
 
@@ -130,35 +131,13 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
+        # 视频端：因为有时间序列，必须用 C2C 专属的 MLP_ST 提取视觉概念
+        # 注意：这里的输出维度已经被你配置成了 512
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
-        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
-        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
-
-        self.hyp_proj_v_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
-        self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
-        self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
-        self.hyp_proj_o_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
-
-        # ====================================================================
-        # 【特征保护修复】：初始化文本映射为单位阵！
-        # 否则随机初始化的线性层会直接摧毁 CLIP 的预训练文本语义，导致前期全是瞎猜
-        # ====================================================================
-        if cfg.feat_dim == cfg.emb_dim:
-            nn.init.eye_(self.c2c_text_v.weight)
-            nn.init.zeros_(self.c2c_text_v.bias)
-            nn.init.eye_(self.c2c_text_o.weight)
-            nn.init.zeros_(self.c2c_text_o.bias)
-
-        nn.init.eye_(self.hyp_proj_v_vis.weight)
-        nn.init.zeros_(self.hyp_proj_v_vis.bias)
-        nn.init.eye_(self.hyp_proj_o_vis.weight)
-        nn.init.zeros_(self.hyp_proj_o_vis.bias)
-        nn.init.eye_(self.hyp_proj_v_text.weight)
-        nn.init.zeros_(self.hyp_proj_v_text.bias)
-        nn.init.eye_(self.hyp_proj_o_text.weight)
-        nn.init.zeros_(self.hyp_proj_o_text.bias)
+        # 文本端与映射端：所有多余的 c2c_text_*, hyp_proj_* 全部被物理超度（删除）！
+        # 完全信任 CLIP 预训练的 512 维特征语义。
 
     def forward(self, video, pairs=None):
         verb_prompts = self.verb_prompt_learner()
@@ -183,9 +162,6 @@ class CustomCLIP(nn.Module):
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
 
-        # ====================================================================
-        # 【限制Alpha】：严禁特征发散放大
-        # ====================================================================
         self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
         self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
         
@@ -193,34 +169,33 @@ class CustomCLIP(nn.Module):
         self.logit_scale_o.data = torch.clamp(self.logit_scale_o.data, max=4.6052)
 
         with torch.autocast(video_features.device.type, dtype=torch.float32):
-            v_feat_tangent = self.hyp_proj_v_vis(v_feat_raw.float()) * self.visual_alpha.exp()
-            o_feat_tangent = self.hyp_proj_o_vis(o_feat_raw.float()) * self.visual_alpha.exp()
-            verb_text_tangent = self.hyp_proj_v_text(verb_text_raw.float()) * self.textual_alpha.exp()
-            obj_text_tangent = self.hyp_proj_o_text(obj_text_raw.float()) * self.textual_alpha.exp()
+            d = v_feat_raw.size(-1) # 获取维度 512
+            
+            # ====================================================================
+            # 【救命代码】：务必乘以 math.sqrt(d)！
+            # 保证初始态 tangent 向量的 norm 是 1.0，彻底破解坍缩黑洞！
+            # ====================================================================
+            v_feat_tangent = F.normalize(v_feat_raw.float(), dim=-1) * math.sqrt(d) * self.visual_alpha.exp()
+            o_feat_tangent = F.normalize(o_feat_raw.float(), dim=-1) * math.sqrt(d) * self.visual_alpha.exp()
+            
+            verb_text_tangent = F.normalize(verb_text_raw.float(), dim=-1) * math.sqrt(d) * self.textual_alpha.exp()
+            obj_text_tangent = F.normalize(obj_text_raw.float(), dim=-1) * math.sqrt(d) * self.textual_alpha.exp()
 
             v_feat_hyp = L.exp_map0(v_feat_tangent, _curv)
             o_feat_hyp = L.exp_map0(o_feat_tangent, _curv)
             verb_text_hyp = L.exp_map0(verb_text_tangent, _curv)
             obj_text_hyp = L.exp_map0(obj_text_tangent, _curv)
 
+            # 纯正的测地线距离
             verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
             obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
 
         if self.training:
             return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
-            # ====================================================================
-            # 【致命 BUG 修复】：测试阶段必须乘回 Temperature！
-            # 否则规范化的双曲距离差异太小，Softmax 会变成全类均匀分布（准确率瞎猜）。
-            # ====================================================================
-            scale_v = self.logit_scale_v.exp()
-            scale_o = self.logit_scale_o.exp()
-            
-            verb_logits_scaled = verb_logits_hyp * scale_v
-            obj_logits_scaled = obj_logits_hyp * scale_o
-            
+            # 严格贯彻：推断时不乘温度系数，返回最纯正的距离
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-            com_logits = verb_logits_scaled[:, verb_idx] + obj_logits_scaled[:, obj_idx]
+            com_logits = verb_logits_hyp[:, verb_idx] + obj_logits_hyp[:, obj_idx]
             return com_logits
 
 def load_clip_to_cpu(cfg):
@@ -239,7 +214,7 @@ def build_model(train_dataset,cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (HyCoCLIP-aligned Hyperbolic)")
+    print("Building custom CLIP (Pure HyCoCLIP Native Mapping)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     print("Turning off gradients in both the image and the text encoder")
     for name, param in model.named_parameters():

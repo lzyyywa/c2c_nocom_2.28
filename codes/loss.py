@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.nn.modules.loss import CrossEntropyLoss
 
 # --- 引入双曲底层算子库 ---
 import models.vlm_models.lorentz as L
@@ -12,34 +11,24 @@ import models.vlm_models.lorentz as L
 
 class EntailmentConeLoss(nn.Module):
     """
-    【双曲层级蕴含损失 - 破除死锁版】
-    加入了 Norm Penalty，彻底解决特征在原点附近时 violation=0 导致的无梯度死锁。
+    【双曲层级蕴含损失 - 纯净版】
+    依赖 L.half_aperture 内部的 min_radius 解决死锁，彻底移除了暴力的范数惩罚。
+    让模型优先专注于语义聚类，而不是被强制推离原点。
     """
-    def __init__(self, aperture_thresh=0.7, norm_weight=0.1):
+    def __init__(self, aperture_thresh=0.7):
         super().__init__()
         # 跨模态/层级推荐阈值 (0.7 或 1.2)
         self.aperture_thresh = aperture_thresh
-        # 范数惩罚的权重
-        self.norm_weight = norm_weight
 
     def forward(self, child_emb, parent_emb, curv):
-        # 1. 角度锥体约束 (Cone Penalty)
-        angle = L.oxy_angle(parent_emb, child_emb, curv)
+        # 计算子节点在父节点视角的夹角和父节点的孔径
+        angle = L.oxy_angle(child_emb, parent_emb, curv)
         aperture = L.half_aperture(parent_emb, curv)
         
-        # 如果特征堆在原点，这里的 violation 极大概率是 0
+        # 只要夹角超出了阈值孔径，就产生损失。移除惩罚范数的额外拉扯。
         violation = torch.clamp(angle - self.aperture_thresh * aperture, min=0.0)
         
-        # 2. 【核心修复】：原点死锁破除器 (Norm Penalty)
-        # 根据双曲层级理论，子节点（更具体的概念）必须比父节点离原点更远。
-        # 加入一个 0.1 的 margin，强迫子节点的范数必须大于父节点。
-        # 只要它们敢停留在原点，这个 penalty 就会源源不断地提供向外的梯度！
-        norm_child = L.safe_norm(child_emb, dim=-1)
-        norm_parent = L.safe_norm(parent_emb, dim=-1)
-        norm_penalty = torch.clamp(norm_parent - norm_child + 0.1, min=0.0)
-        
-        # 两者结合，彻底斩断死锁链条
-        return (violation + self.norm_weight * norm_penalty).mean()
+        return violation.mean()
 
 
 class HyperbolicHardNegativeAlignmentLoss(nn.Module):

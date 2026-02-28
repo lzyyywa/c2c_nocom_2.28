@@ -131,13 +131,32 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
-        # 视频端：因为有时间序列，必须用 C2C 专属的 MLP_ST 提取视觉概念
-        # 注意：这里的输出维度已经被你配置成了 512
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
-        # 文本端与映射端：所有多余的 c2c_text_*, hyp_proj_* 全部被物理超度（删除）！
-        # 完全信任 CLIP 预训练的 512 维特征语义。
+        # ====================================================================
+        # 【对齐官方的无参直通映射层】
+        # 这里定义了 c2c_text 和 hyp_proj 层。如果 config 是 512，
+        # 则完美替换为 nn.Identity()，绝对安全，不会崩溃！
+        # ====================================================================
+        if cfg.feat_dim == cfg.emb_dim:
+            self.c2c_text_v = nn.Identity()
+            self.c2c_text_o = nn.Identity()
+            self.hyp_proj_v_vis = nn.Identity()
+            self.hyp_proj_o_vis = nn.Identity()
+            self.hyp_proj_v_text = nn.Identity()
+            self.hyp_proj_o_text = nn.Identity()
+        else:
+            self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
+            self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
+            self.hyp_proj_v_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+            self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+            self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+            self.hyp_proj_o_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+            nn.init.eye_(self.hyp_proj_v_vis.weight); nn.init.zeros_(self.hyp_proj_v_vis.bias)
+            nn.init.eye_(self.hyp_proj_o_vis.weight); nn.init.zeros_(self.hyp_proj_o_vis.bias)
+            nn.init.eye_(self.hyp_proj_v_text.weight); nn.init.zeros_(self.hyp_proj_v_text.bias)
+            nn.init.eye_(self.hyp_proj_o_text.weight); nn.init.zeros_(self.hyp_proj_o_text.bias)
 
     def forward(self, video, pairs=None):
         verb_prompts = self.verb_prompt_learner()
@@ -169,31 +188,36 @@ class CustomCLIP(nn.Module):
         self.logit_scale_o.data = torch.clamp(self.logit_scale_o.data, max=4.6052)
 
         with torch.autocast(video_features.device.type, dtype=torch.float32):
-            d = v_feat_raw.size(-1) # 获取维度 512
+            d = v_feat_raw.size(-1)
             
             # ====================================================================
-            # 【救命代码】：务必乘以 math.sqrt(d)！
-            # 保证初始态 tangent 向量的 norm 是 1.0，彻底破解坍缩黑洞！
+            # 【核心：保角缩放】 F.normalize() * math.sqrt(d)
+            # 保证所有特征的初始范数都在最健康的范围内！
             # ====================================================================
-            v_feat_tangent = F.normalize(v_feat_raw.float(), dim=-1) * math.sqrt(d) * self.visual_alpha.exp()
-            o_feat_tangent = F.normalize(o_feat_raw.float(), dim=-1) * math.sqrt(d) * self.visual_alpha.exp()
-            
-            verb_text_tangent = F.normalize(verb_text_raw.float(), dim=-1) * math.sqrt(d) * self.textual_alpha.exp()
-            obj_text_tangent = F.normalize(obj_text_raw.float(), dim=-1) * math.sqrt(d) * self.textual_alpha.exp()
+            v_feat_stable = F.normalize(v_feat_raw.float(), dim=-1) * math.sqrt(d)
+            o_feat_stable = F.normalize(o_feat_raw.float(), dim=-1) * math.sqrt(d)
+            verb_text_stable = F.normalize(verb_text_raw.float(), dim=-1) * math.sqrt(d)
+            obj_text_stable = F.normalize(obj_text_raw.float(), dim=-1) * math.sqrt(d)
+
+            # 穿过可能是 Identity 也可能是 Linear 的 hyp_proj 层
+            v_feat_tangent = self.hyp_proj_v_vis(v_feat_stable) * self.visual_alpha.exp()
+            o_feat_tangent = self.hyp_proj_o_vis(o_feat_stable) * self.visual_alpha.exp()
+            verb_text_tangent = self.hyp_proj_v_text(verb_text_stable) * self.textual_alpha.exp()
+            obj_text_tangent = self.hyp_proj_o_text(obj_text_stable) * self.textual_alpha.exp()
 
             v_feat_hyp = L.exp_map0(v_feat_tangent, _curv)
             o_feat_hyp = L.exp_map0(o_feat_tangent, _curv)
             verb_text_hyp = L.exp_map0(verb_text_tangent, _curv)
             obj_text_hyp = L.exp_map0(obj_text_tangent, _curv)
 
-            # 纯正的测地线距离
+            # 纯正测地线负距离
             verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
             obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
 
         if self.training:
             return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
-            # 严格贯彻：推断时不乘温度系数，返回最纯正的距离
+            # 推断不乘温度
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = verb_logits_hyp[:, verb_idx] + obj_logits_hyp[:, obj_idx]
             return com_logits

@@ -115,15 +115,12 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
 
-        # 释放曲率学习，严格限制范围在 [0.1, 10.0]
         self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
         self._curv_minmax = {"max": math.log(10.0), "min": math.log(0.1)}
 
-        # 严格对齐 MERU/HyCoCLIP: alpha 初始化为 1/sqrt(d)
         self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
         self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
 
-        # 注意：为了稳定，如果你发现后期梯度依然过大，可以在外围把初始化改小为 torch.tensor(1.0).log()
         self.logit_scale_v = nn.Parameter(torch.tensor(1 / 0.07).log())
         self.logit_scale_o = nn.Parameter(torch.tensor(1 / 0.07).log())
 
@@ -143,6 +140,16 @@ class CustomCLIP(nn.Module):
         self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_o_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
+
+        # ====================================================================
+        # 【特征保护修复】：初始化文本映射为单位阵！
+        # 否则随机初始化的线性层会直接摧毁 CLIP 的预训练文本语义，导致前期全是瞎猜
+        # ====================================================================
+        if cfg.feat_dim == cfg.emb_dim:
+            nn.init.eye_(self.c2c_text_v.weight)
+            nn.init.zeros_(self.c2c_text_v.bias)
+            nn.init.eye_(self.c2c_text_o.weight)
+            nn.init.zeros_(self.c2c_text_o.bias)
 
         nn.init.eye_(self.hyp_proj_v_vis.weight)
         nn.init.zeros_(self.hyp_proj_v_vis.bias)
@@ -173,28 +180,19 @@ class CustomCLIP(nn.Module):
         verb_text_raw = torch.nan_to_num(verb_text_features)
         obj_text_raw = torch.nan_to_num(obj_text_features)
 
-        # ==============================================================
-        # 【限制曲率更新范围】
-        # ==============================================================
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
 
-        # ==============================================================
-        # 【修复1：重新封印 Alpha】：限制 alpha 最大为 0 (即 exp(alpha) 最大为 1)
-        # 防止特征在进入双曲空间前被无限制放大导致距离崩坏
-        # ==============================================================
+        # ====================================================================
+        # 【限制Alpha】：严禁特征发散放大
+        # ====================================================================
         self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
         self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
         
-        # 将温度截断放在外部确保其全局生效
         self.logit_scale_v.data = torch.clamp(self.logit_scale_v.data, max=4.6052)
         self.logit_scale_o.data = torch.clamp(self.logit_scale_o.data, max=4.6052)
 
         with torch.autocast(video_features.device.type, dtype=torch.float32):
-            # ==============================================================
-            # 【修复2：删除暴力 Clamp】：直接使用 raw 特征
-            # 方向绝对不截断，让底层 lorentz 算子用安全的 Norm 机制限制范数
-            # ==============================================================
             v_feat_tangent = self.hyp_proj_v_vis(v_feat_raw.float()) * self.visual_alpha.exp()
             o_feat_tangent = self.hyp_proj_o_vis(o_feat_raw.float()) * self.visual_alpha.exp()
             verb_text_tangent = self.hyp_proj_v_text(verb_text_raw.float()) * self.textual_alpha.exp()
@@ -205,15 +203,24 @@ class CustomCLIP(nn.Module):
             verb_text_hyp = L.exp_map0(verb_text_tangent, _curv)
             obj_text_hyp = L.exp_map0(obj_text_tangent, _curv)
 
-            # 计算双曲负距离（-distance）
             verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
             obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
 
         if self.training:
             return verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
+            # ====================================================================
+            # 【致命 BUG 修复】：测试阶段必须乘回 Temperature！
+            # 否则规范化的双曲距离差异太小，Softmax 会变成全类均匀分布（准确率瞎猜）。
+            # ====================================================================
+            scale_v = self.logit_scale_v.exp()
+            scale_o = self.logit_scale_o.exp()
+            
+            verb_logits_scaled = verb_logits_hyp * scale_v
+            obj_logits_scaled = obj_logits_hyp * scale_o
+            
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-            com_logits = verb_logits_hyp[:, verb_idx] + obj_logits_hyp[:, obj_idx]
+            com_logits = verb_logits_scaled[:, verb_idx] + obj_logits_scaled[:, obj_idx]
             return com_logits
 
 def load_clip_to_cpu(cfg):
@@ -248,9 +255,6 @@ def build_model(train_dataset,cfg):
         elif 'video_encoder' in name and ('temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name):
             param.requires_grad = True
         
-        # ==============================================================
-        # 【恢复 hyp_proj 更新】：解冻双曲基底投影变换
-        # ==============================================================
         elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name or 'logit_scale' in name:
             param.requires_grad = True
     return model

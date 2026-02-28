@@ -181,11 +181,11 @@ class CustomCLIP(nn.Module):
         verb_text_stable = torch.clamp(verb_text_raw, min=-50.0, max=50.0)
         obj_text_stable = torch.clamp(obj_text_raw, min=-50.0, max=50.0)
 
-        # 参数安全截断
+        # ==============================================================
+        # 【解除 Alpha 封印】：删除了 clamp(max=0.0)，让模型自由地将特征推向边缘！
+        # ==============================================================
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
-        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
-        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
-
+        
         # 将温度截断放在外部确保其全局生效
         self.logit_scale_v.data = torch.clamp(self.logit_scale_v.data, max=4.6052)
         self.logit_scale_o.data = torch.clamp(self.logit_scale_o.data, max=4.6052)
@@ -247,8 +247,8 @@ def build_model(train_dataset,cfg):
             param.requires_grad = True
         
         # ==============================================================
-        # 【HyCoCLIP 对齐修复】：去除 hyp_proj 的更新权限，防止模型靠权重变0来作弊
+        # 【恢复 hyp_proj 更新】：解冻双曲基底投影变换
         # ==============================================================
-        elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'logit_scale' in name:
+        elif 'c2c' in name or 'curv' in name or 'alpha' in name or 'hyp_proj' in name or 'logit_scale' in name:
             param.requires_grad = True
     return model

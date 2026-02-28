@@ -12,37 +12,40 @@ import models.vlm_models.lorentz as L
 
 class EntailmentConeLoss(nn.Module):
     """
-    【完全对齐 HyCoCLIP】双曲层级蕴含损失 (Aperture-Thresholded Entailment)
-    放弃人为构造的 norm_penalty，采用官方的“孔径缩水”策略强迫特征远离原点。
-    
-    原理：在双曲空间中，越靠近原点，能覆盖的孔径（aperture）越大（接近180度）。
-    如果我们人为将孔径缩小（例如乘以 0.7），而在原点附近的特征因为重叠导致夹角变大，
-    就会直接越过这个变窄的孔径产生巨大的 Loss。
-    为了降低 Loss，模型唯一的出路就是将父子节点整体向双曲空间的边缘推。
+    【双曲层级蕴含损失 - 破除死锁版】
+    加入了 Norm Penalty，彻底解决特征在原点附近时 violation=0 导致的无梯度死锁。
     """
-    def __init__(self, aperture_thresh=0.7):
+    def __init__(self, aperture_thresh=0.7, norm_weight=0.1):
         super().__init__()
-        # HyCoCLIP 官方跨模态/层级推荐阈值 (例如 0.7 或 1.2)
+        # 跨模态/层级推荐阈值 (0.7 或 1.2)
         self.aperture_thresh = aperture_thresh
+        # 范数惩罚的权重
+        self.norm_weight = norm_weight
 
     def forward(self, child_emb, parent_emb, curv):
-        # 1. 计算父节点到子节点的实际夹角
+        # 1. 角度锥体约束 (Cone Penalty)
         angle = L.oxy_angle(parent_emb, child_emb, curv)
-        
-        # 2. 计算父节点的理论半顶角 (孔径)
         aperture = L.half_aperture(parent_emb, curv)
         
-        # 3. HyCoCLIP 核心防坍缩逻辑：孔径缩水
-        # 要求实际夹角必须小于缩水后的孔径。
+        # 如果特征堆在原点，这里的 violation 极大概率是 0
         violation = torch.clamp(angle - self.aperture_thresh * aperture, min=0.0)
         
-        return violation.mean()
+        # 2. 【核心修复】：原点死锁破除器 (Norm Penalty)
+        # 根据双曲层级理论，子节点（更具体的概念）必须比父节点离原点更远。
+        # 加入一个 0.1 的 margin，强迫子节点的范数必须大于父节点。
+        # 只要它们敢停留在原点，这个 penalty 就会源源不断地提供向外的梯度！
+        norm_child = L.safe_norm(child_emb, dim=-1)
+        norm_parent = L.safe_norm(parent_emb, dim=-1)
+        norm_penalty = torch.clamp(norm_parent - norm_child + 0.1, min=0.0)
+        
+        # 两者结合，彻底斩断死锁链条
+        return (violation + self.norm_weight * norm_penalty).mean()
 
 
 class HyperbolicHardNegativeAlignmentLoss(nn.Module):
     """
     【双曲语义级判别对齐损失】(Semantic Discriminative Alignment)
-    完全对齐 H2EM/HyCoCLIP 思想：在共享粗粒度语义 (Coarse-level) 的难负样本集中进行排斥。
+    在共享粗粒度语义 (Coarse-level) 的难负样本集中进行排斥。
     """
     def __init__(self, margin=0.2):
         super().__init__()
@@ -58,11 +61,11 @@ class HyperbolicHardNegativeAlignmentLoss(nn.Module):
         
         # 2. 确定候选的负样本集合
         if hard_mask is None:
-            # 如果不传 mask，回退到全局难负样本 (Global Hard Negative)
+            # 如果不传 mask，回退到全局难负样本
             mask = torch.ones_like(dists, dtype=torch.bool)
             mask.scatter_(1, labels.view(-1, 1), False)
         else:
-            # [核心逻辑]：使用传入的语义难负样本 Mask！(只考虑同粗类下的其他细类)
+            # 使用传入的语义难负样本 Mask
             mask = hard_mask
         
         # 将不允许作为负样本的位置设为无穷大，这样在取 min 时绝对不会选中它们

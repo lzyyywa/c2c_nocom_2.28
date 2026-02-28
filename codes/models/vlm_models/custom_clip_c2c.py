@@ -123,6 +123,7 @@ class CustomCLIP(nn.Module):
         self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
         self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim ** -0.5).log())
 
+        # 注意：为了稳定，如果你发现后期梯度依然过大，可以在外围把初始化改小为 torch.tensor(1.0).log()
         self.logit_scale_v = nn.Parameter(torch.tensor(1 / 0.07).log())
         self.logit_scale_o = nn.Parameter(torch.tensor(1 / 0.07).log())
 
@@ -173,30 +174,31 @@ class CustomCLIP(nn.Module):
         obj_text_raw = torch.nan_to_num(obj_text_features)
 
         # ==============================================================
-        # 【HyCoCLIP 对齐修复】：严禁 F.normalize! 允许特征保留原始范数
-        # 只做 Clamp 保证数值稳定不溢出
-        # ==============================================================
-        v_feat_stable = torch.clamp(v_feat_raw, min=-50.0, max=50.0)
-        o_feat_stable = torch.clamp(o_feat_raw, min=-50.0, max=50.0)
-        verb_text_stable = torch.clamp(verb_text_raw, min=-50.0, max=50.0)
-        obj_text_stable = torch.clamp(obj_text_raw, min=-50.0, max=50.0)
-
-        # ==============================================================
-        # 【解除 Alpha 封印】：删除了 clamp(max=0.0)，让模型自由地将特征推向边缘！
+        # 【限制曲率更新范围】
         # ==============================================================
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
+        _curv = self.curv.exp()
+
+        # ==============================================================
+        # 【修复1：重新封印 Alpha】：限制 alpha 最大为 0 (即 exp(alpha) 最大为 1)
+        # 防止特征在进入双曲空间前被无限制放大导致距离崩坏
+        # ==============================================================
+        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
+        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
         
         # 将温度截断放在外部确保其全局生效
         self.logit_scale_v.data = torch.clamp(self.logit_scale_v.data, max=4.6052)
         self.logit_scale_o.data = torch.clamp(self.logit_scale_o.data, max=4.6052)
 
-        _curv = self.curv.exp()
-
         with torch.autocast(video_features.device.type, dtype=torch.float32):
-            v_feat_tangent = self.hyp_proj_v_vis(v_feat_stable.float()) * self.visual_alpha.exp()
-            o_feat_tangent = self.hyp_proj_o_vis(o_feat_stable.float()) * self.visual_alpha.exp()
-            verb_text_tangent = self.hyp_proj_v_text(verb_text_stable.float()) * self.textual_alpha.exp()
-            obj_text_tangent = self.hyp_proj_o_text(obj_text_stable.float()) * self.textual_alpha.exp()
+            # ==============================================================
+            # 【修复2：删除暴力 Clamp】：直接使用 raw 特征
+            # 方向绝对不截断，让底层 lorentz 算子用安全的 Norm 机制限制范数
+            # ==============================================================
+            v_feat_tangent = self.hyp_proj_v_vis(v_feat_raw.float()) * self.visual_alpha.exp()
+            o_feat_tangent = self.hyp_proj_o_vis(o_feat_raw.float()) * self.visual_alpha.exp()
+            verb_text_tangent = self.hyp_proj_v_text(verb_text_raw.float()) * self.textual_alpha.exp()
+            obj_text_tangent = self.hyp_proj_o_text(obj_text_raw.float()) * self.textual_alpha.exp()
 
             v_feat_hyp = L.exp_map0(v_feat_tangent, _curv)
             o_feat_hyp = L.exp_map0(o_feat_tangent, _curv)

@@ -89,7 +89,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     mask_device = train_pairs.device
     verb_hard_mask_matrix = verb_hard_mask_matrix.to(mask_device)
     obj_hard_mask_matrix = obj_hard_mask_matrix.to(mask_device)
-    
+
     train_losses = []
 
     for i in range(config.epoch_start, config.epochs):
@@ -109,11 +109,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             with torch.cuda.amp.autocast(enabled=True):
                 verb_logits_hyp, obj_logits_hyp, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
-                
+
             with torch.cuda.amp.autocast(enabled=False):
                 _curv_fp32 = _curv.float()
                 import models.vlm_models.lorentz as L
-                
+
                 v_child_scaled_tangent = L.log_map0(verb_text_hyp.float(), _curv_fp32)
                 o_child_scaled_tangent = L.log_map0(obj_text_hyp.float(), _curv_fp32)
 
@@ -136,59 +136,68 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                 all_coarse_v_hyp = L.exp_map0(all_coarse_v_scaled, _curv_fp32)
                 all_coarse_o_hyp = L.exp_map0(all_coarse_o_scaled, _curv_fp32)
-                
+
+                # ==============================================================
+                # 1. 严格从 Config 读取所有系数 (赋予默认值以防报错)
+                # ==============================================================
                 w_att_obj = getattr(config, 'att_obj_w', 0.2)
-                w_entail = getattr(config, 'lambda_entail', getattr(config, 'w_entail', 0.1))
-                w_align = getattr(config, 'lambda_align', getattr(config, 'w_align', 1.0))
+                w_entail = getattr(config, 'lambda_entail', 0.1)
+                w_align = getattr(config, 'lambda_align', 1.0)
                 align_margin = getattr(config, 'align_margin', 0.2)
-                
+
+                # 动词松绑系数：默认为 1.0（即一视同仁，不打折）
+                verb_relax_ratio = getattr(config, 'verb_relax_ratio', 1.0)
+
+                # 孔径缩水阈值：允许从 config 配置，默认保留 HyCoCLIP 的 0.7/1.2
+                entail_thresh_global = getattr(config, 'entail_thresh_global', 0.7)
+                entail_thresh_local = getattr(config, 'entail_thresh_local', 1.2)
+
                 # ==============================================================
-                # 【HyCoCLIP 对齐修复】：区分 Local (1.2) 和 Global (0.7) 阈值
+                # 2. 实例化损失函数
                 # ==============================================================
-                entail_loss_global = EntailmentConeLoss(aperture_thresh=0.7)  # 跨模态 Text->Video
-                entail_loss_local = EntailmentConeLoss(aperture_thresh=1.2)   # 同模态 Coarse->Fine
-                
+                entail_loss_global = EntailmentConeLoss(aperture_thresh=entail_thresh_global)  # 跨模态 Text->Video
+                entail_loss_local = EntailmentConeLoss(aperture_thresh=entail_thresh_local)   # 同模态 Coarse->Fine
+
                 align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=align_margin)
-                verb_relax_ratio = getattr(config, 'verb_relax_ratio', 0.2)
 
                 # 温度放大
                 actual_model.logit_scale_v.data = torch.clamp(actual_model.logit_scale_v.data, max=4.6052)
                 actual_model.logit_scale_o.data = torch.clamp(actual_model.logit_scale_o.data, max=4.6052)
                 scale_v = actual_model.logit_scale_v.exp()
                 scale_o = actual_model.logit_scale_o.exp()
-                
+
                 verb_logits_scaled = verb_logits_hyp * scale_v
                 obj_logits_scaled = obj_logits_hyp * scale_o
-                
+
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 pred_com_train = verb_logits_scaled[:, train_v_inds] + obj_logits_scaled[:, train_o_inds]
-                
+
                 loss_com = Loss_fn(pred_com_train, batch_target)
                 loss_verb_hyp = Loss_fn(verb_logits_scaled, batch_verb)
                 loss_obj_hyp = Loss_fn(obj_logits_scaled, batch_obj)
-                
+
                 batch_v_mask = verb_hard_mask_matrix[batch_verb]
                 batch_o_mask = obj_hard_mask_matrix[batch_obj]
-                
+
                 loss_align_v = align_loss_fn(verb_logits_hyp, batch_verb, hard_mask=batch_v_mask)
                 loss_align_o = align_loss_fn(obj_logits_hyp, batch_obj, hard_mask=batch_o_mask)
                 loss_alignment = (verb_relax_ratio * loss_align_v) + loss_align_o
-                
-                # 同模态约束 (Local: 1.2)
+
+                # 同模态约束 (Local)
                 loss_ent_v = entail_loss_local(verb_text_hyp.float(), all_coarse_v_hyp[fine2coarse_v_idx], _curv_fp32)
                 loss_ent_o = entail_loss_local(obj_text_hyp.float(), all_coarse_o_hyp[fine2coarse_o_idx], _curv_fp32)
-                
-                # 跨模态约束 (Global: 0.7)
+
+                # 跨模态约束 (Global)
                 batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
                 batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
                 loss_ent_vid_v = entail_loss_global(v_feat_hyp.float(), batch_fine_v_hyp, _curv_fp32)
                 loss_ent_vid_o = entail_loss_global(o_feat_hyp.float(), batch_fine_o_hyp, _curv_fp32)
-                
+
                 # ==============================================================
-                # 【HyCoCLIP 对齐修复】：压低 Entailment Loss 的总梯度占比 (乘以 0.25)
+                # 3. 组装蕴含损失 (无任何强行缩放，全额输出，听从 config 调遣)
                 # ==============================================================
-                loss_entailment = 0.25 * ((verb_relax_ratio * loss_ent_v) + loss_ent_o + (verb_relax_ratio * loss_ent_vid_v) + loss_ent_vid_o)
-                
+                loss_entailment = (verb_relax_ratio * loss_ent_v) + loss_ent_o + (verb_relax_ratio * loss_ent_vid_v) + loss_ent_vid_o
+
                 loss = loss_com + w_att_obj * (loss_verb_hyp + loss_obj_hyp) + w_entail * loss_entailment + w_align * loss_alignment
                 loss = torch.nan_to_num(loss) / config.gradient_accumulation_steps
 
@@ -213,9 +222,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
         lr_scheduler.step()
         progress_bar.close()
-        
+
         print(f"epoch {i + 1} | train loss: {np.mean(epoch_train_losses):.4f} | ent loss: {np.mean(epoch_ent_losses):.4f} | ali loss: {np.mean(epoch_ali_losses):.4f} | curv c: {np.mean(epoch_curv):.4f}")
-        
+
         train_losses.append(np.mean(epoch_train_losses))
         log_training.write('\n')
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}\n")
@@ -233,9 +242,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 'scheduler': lr_scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
             }, config.save_path, i)
-            
+
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
-        
+
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
             print("Evaluating val dataset:")
             loss_avg, val_result = evaluate(model, val_dataset, config)
@@ -248,7 +257,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             print("Loss average on val dataset: {}".format(loss_avg))
             log_training.write('\n')
             log_training.write("Loss average on val dataset: {}\n".format(loss_avg))
-            
+
             if config.best_model_metric == "best_loss":
                 if loss_avg.cpu().float() < best_loss:
                     print('find best!')
@@ -283,10 +292,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     print("Loss average on test dataset: {}".format(loss_avg))
                     log_training.write('\n')
                     log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
-        
+
         log_training.write('\n')
         log_training.flush()
-        
+
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
         if i + 1 == config.epochs:
             print("Evaluating test dataset on Closed World")
